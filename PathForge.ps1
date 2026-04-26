@@ -2925,6 +2925,15 @@ Log Files: $($Script:Config.LogPath)
 # ============================================================================
 function Build-MainForm {
     $form = New-Object System.Windows.Forms.Form
+# codex-branding:start
+                $brandingIconPath = Join-Path $PSScriptRoot 'icon.ico'
+                if (Test-Path $brandingIconPath) {
+                    try {
+                        $form.Icon = New-Object System.Drawing.Icon($brandingIconPath)
+                    } catch {
+                    }
+                }
+                # codex-branding:end
     $form.Text = "PathForge v$($Script:Config.Version)"
     $form.Size = New-Object System.Drawing.Size(1020, 900)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen

@@ -6,7 +6,7 @@
     permission management, and drive diagnostics with comprehensive
     educational information panels.
 .VERSION
-    3.0.0
+    3.1.0
 #>
 
 #Requires -RunAsAdministrator
@@ -63,7 +63,7 @@ public class BootDelete {
 # CONFIGURATION
 # ============================================================================
 $Script:Config = @{
-    Version   = "3.0.0"
+    Version   = "3.1.0"
     AppName   = "PathForge"
     LogPath   = "$env:USERPROFILE\Documents\PathForge_Logs"
     MaxLogAge = 30

@@ -14,6 +14,20 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# DPI awareness - call before any form creation
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class DpiHelper {
+    [DllImport("user32.dll")]
+    public static extern bool SetProcessDPIAware();
+    [DllImport("shcore.dll")]
+    public static extern int SetProcessDpiAwareness(int awareness);
+}
+"@ -ErrorAction SilentlyContinue
+try { [DpiHelper]::SetProcessDpiAwareness(2) }
+catch { try { [void][DpiHelper]::SetProcessDPIAware() } catch { } }
+
 # Dark mode title bar API
 Add-Type -TypeDefinition @"
 using System;
@@ -1556,16 +1570,18 @@ function Invoke-ChkdskWithProgress {
     }
     
     $process.EnableRaisingEvents = $true
-    $null = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
-    
+    $eventJob = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
+
     $null = $process.Start()
     $process.BeginOutputReadLine()
-    
+
     while (-not $process.HasExited) {
         [System.Windows.Forms.Application]::DoEvents()
         Start-Sleep -Milliseconds 100
     }
-    
+
+    Unregister-Event -SourceIdentifier $eventJob.Name -ErrorAction SilentlyContinue
+    Remove-Job -Job $eventJob -Force -ErrorAction SilentlyContinue
     Set-Progress -Value 0
 }
 
@@ -1858,7 +1874,7 @@ function Get-DriveHealth {
     Write-Console "" -Type "Normal"
     Write-Console "--- SMART Failure Prediction ---" -Type "Info"
     try {
-        $smart = Get-WmiObject -Namespace root\wmi -Class MSStorageDriver_FailurePredictStatus -ErrorAction Stop
+        $smart = Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop
         if ($smart) {
             foreach ($s in $smart) {
                 $name = ($s.InstanceName -replace '_0$', '' -split '\\')[-1]
@@ -2819,7 +2835,7 @@ function Build-DiagnosticsPage {
         Write-Console "=== SMART Failure Prediction ===" -Type "Info"
         Write-Console "" -Type "Normal"
         try {
-            $smart = Get-WmiObject -Namespace root\wmi -Class MSStorageDriver_FailurePredictStatus -ErrorAction Stop
+            $smart = Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop
             if ($smart) {
                 foreach ($s in $smart) {
                     $name = ($s.InstanceName -replace '_0$', '' -split '\\')[-1]

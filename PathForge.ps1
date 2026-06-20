@@ -7,7 +7,18 @@
     educational information panels.
 .VERSION
     3.1.0
+.PARAMETER Path
+    Optional file or folder path to pre-fill in the target path field.
+.PARAMETER InstallContextMenu
+    Register PathForge in the Windows Explorer right-click context menu.
+.PARAMETER RemoveContextMenu
+    Remove PathForge from the Windows Explorer right-click context menu.
 #>
+param(
+    [string]$Path,
+    [switch]$InstallContextMenu,
+    [switch]$RemoveContextMenu
+)
 
 #Requires -RunAsAdministrator
 
@@ -3324,23 +3335,70 @@ function Build-MainForm {
 }
 
 # ============================================================================
+# CONTEXT MENU INTEGRATION
+# ============================================================================
+function Install-ContextMenu {
+    $scriptPath = $PSCommandPath
+    $keyPaths = @(
+        "Registry::HKEY_CLASSES_ROOT\*\shell\PathForge",
+        "Registry::HKEY_CLASSES_ROOT\Directory\shell\PathForge"
+    )
+    foreach ($keyPath in $keyPaths) {
+        $null = New-Item -Path $keyPath -Force
+        Set-ItemProperty -Path $keyPath -Name "(Default)" -Value "Open with PathForge"
+        Set-ItemProperty -Path $keyPath -Name "Icon" -Value "powershell.exe,0"
+        $cmdPath = "$keyPath\command"
+        $null = New-Item -Path $cmdPath -Force
+        Set-ItemProperty -Path $cmdPath -Name "(Default)" -Value "powershell.exe -ExecutionPolicy Bypass -NoProfile -File `"$scriptPath`" -Path `"%1`""
+    }
+    Write-Host "PathForge context menu installed. Right-click any file or folder to see 'Open with PathForge'."
+}
+
+function Remove-ContextMenu {
+    $keyPaths = @(
+        "Registry::HKEY_CLASSES_ROOT\*\shell\PathForge",
+        "Registry::HKEY_CLASSES_ROOT\Directory\shell\PathForge"
+    )
+    foreach ($keyPath in $keyPaths) {
+        if (Test-Path $keyPath) {
+            Remove-Item -Path $keyPath -Recurse -Force
+        }
+    }
+    Write-Host "PathForge context menu removed."
+}
+
+# ============================================================================
 # ENTRY POINT
 # ============================================================================
+if ($InstallContextMenu) {
+    Install-ContextMenu
+    return
+}
+if ($RemoveContextMenu) {
+    Remove-ContextMenu
+    return
+}
+
 function Start-Application {
+    param([string]$InitialPath)
     Initialize-Logging
     try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch {}
-    
+
     $mainForm = Build-MainForm
-    
+
     $mainForm.Add_Shown({
         Write-Console "PathForge v$($Script:Config.Version) initialized" -Type "Info"
         Write-Console "Log location: $Script:LogFile" -Type "Normal"
         Write-Console "" -Type "Normal"
         Write-Console "TIP: Click '[i] Show Details' on any blue panel to learn more!" -Type "Info"
-    })
-    
+        if ($InitialPath -and $Script:PathTextBox) {
+            $Script:PathTextBox.Text = $InitialPath
+            Write-Console "Path pre-filled: $InitialPath" -Type "Info"
+        }
+    }.GetNewClosure())
+
     [void]$mainForm.ShowDialog()
     $mainForm.Dispose()
 }
 
-Start-Application
+Start-Application -InitialPath $Path

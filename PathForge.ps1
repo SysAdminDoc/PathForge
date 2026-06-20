@@ -845,11 +845,13 @@ function Get-VolumeFileSystem {
     param([string]$Path)
     try {
         $root = [System.IO.Path]::GetPathRoot($Path)
-        $letter = $root.TrimEnd('\', '/')
-        $vol = Get-Volume -DriveLetter $letter[0] -ErrorAction SilentlyContinue
+        if (-not $root -or $root.StartsWith('\\')) { return "Unknown" }
+        $letter = $root.TrimEnd('\', ':')
+        if ($letter.Length -ne 1 -or $letter -notmatch '[A-Za-z]') { return "Unknown" }
+        $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
         if ($vol) { return $vol.FileSystem }
     }
-    catch { }
+    catch { Write-Log "Volume filesystem query failed for $Path : $_" -Level "WARN" }
     return "Unknown"
 }
 
@@ -909,10 +911,10 @@ function Remove-ItemLongPath {
     try {
         $longPath = "\\?\$Path"
         if (Test-Path -LiteralPath $Path -PathType Container) {
-            $proc = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
+            $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
         }
         else {
-            $proc = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "del /f /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
+            $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "del /f /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
         }
         if (-not (Test-Path -LiteralPath $Path)) {
             return @{Success = $true; Method = "Long Path (\\?\)" }
@@ -1003,7 +1005,7 @@ function Test-ReparsePoint {
 function Remove-ReparsePointSafe {
     param([string]$Path)
     if (Test-ReparsePoint -Path $Path) {
-        $null = cmd /c "rmdir `"$Path`"" 2>&1
+        $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rmdir `"$Path`"" -NoNewWindow -Wait -PassThru 2>$null
         return -not (Test-Path -LiteralPath $Path)
     }
     return $false
@@ -1107,8 +1109,8 @@ function Invoke-ForceDelete {
         }
     }
     
-    Write-Console "All 6 deletion methods failed" -Type "Error"
-    Write-Log "All methods failed: $Path" -Level "ERROR"
+    Write-Console "All $($methods.Count) deletion methods failed" -Type "Error"
+    Write-Log "All $($methods.Count) methods failed: $Path" -Level "ERROR"
     Set-Status "Ready"
     Set-Progress -Value 0
     
@@ -1210,7 +1212,10 @@ function Reset-ItemPermissions {
 
 function Backup-ACL {
     param([string]$Path)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) { Write-Console "Rejected: $($check.Reason)" -Type "Error"; return $false }
+
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $backupFile = Join-Path $Script:Config.LogPath "ACL_Backup_$timestamp.txt"
     
@@ -1242,7 +1247,10 @@ function Backup-ACL {
 
 function Restore-ACL {
     param([string]$Path, [string]$BackupFile)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) { Write-Console "Rejected: $($check.Reason)" -Type "Error"; return $false }
+
     Write-Console "Restoring ACLs from: $BackupFile" -Type "Info"
     Write-Console "Running: icacls `"$Path`" /restore `"$BackupFile`"" -Type "Progress"
     Set-Status "Restoring ACLs..."
@@ -1269,7 +1277,10 @@ function Restore-ACL {
 
 function Remove-OrphanedSIDs {
     param([string]$Path, [switch]$Recurse)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) { Write-Console "Rejected: $($check.Reason)" -Type "Error"; return }
+
     Write-Console "Scanning for orphaned SIDs (deleted accounts)..." -Type "Info"
     Write-Console "Pattern: S-1-5-21-* entries that don't resolve to usernames" -Type "Normal"
     Set-Status "Scanning..."
@@ -1322,7 +1333,10 @@ function Remove-OrphanedSIDs {
 
 function Get-ACLReport {
     param([string]$Path)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) { Write-Console "Rejected: $($check.Reason)" -Type "Error"; return }
+
     Write-Console "Generating ACL report for: $Path" -Type "Info"
     Set-Status "Analyzing permissions..."
     
@@ -1380,7 +1394,7 @@ function Export-ACLReport {
             $items += Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
         }
 
-        $rows = @()
+        $rows = [System.Collections.Generic.List[PSObject]]::new()
         $total = $items.Count
         $processed = 0
 
@@ -1393,7 +1407,7 @@ function Export-ACLReport {
             try {
                 $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
                 foreach ($ace in $acl.Access) {
-                    $rows += [PSCustomObject]@{
+                    $rows.Add([PSCustomObject]@{
                         Path = $item.FullName
                         Owner = $acl.Owner
                         Identity = $ace.IdentityReference.Value
@@ -1402,7 +1416,7 @@ function Export-ACLReport {
                         Inherited = $ace.IsInherited
                         InheritanceFlags = $ace.InheritanceFlags.ToString()
                         PropagationFlags = $ace.PropagationFlags.ToString()
-                    }
+                    })
                 }
             }
             catch { Write-Log "ACL export error on $($item.FullName): $_" -Level "WARN" }
@@ -1556,28 +1570,28 @@ function Invoke-ADSScanner {
         $items += Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
     }
     
-    $adsFound = @()
+    $adsFound = [System.Collections.Generic.List[PSObject]]::new()
     $count = 0
     $total = $items.Count
-    
+
     foreach ($item in $items) {
         $count++
-        if ($count % 50 -eq 0) { 
-            Set-Progress -Value $count -Maximum $total 
+        if ($count % 50 -eq 0) {
+            Set-Progress -Value $count -Maximum $total
             Set-Status "Scanning $count/$total..."
         }
-        
+
         try {
             $streams = Get-Item -LiteralPath $item.FullName -Stream * -ErrorAction SilentlyContinue
             $altStreams = $streams | Where-Object { $_.Stream -ne ':$DATA' }
-            
+
             if ($altStreams) {
                 foreach ($stream in $altStreams) {
-                    $adsFound += [PSCustomObject]@{
+                    $adsFound.Add([PSCustomObject]@{
                         Path   = $item.FullName
                         Stream = $stream.Stream
                         Size   = $stream.Length
-                    }
+                    })
                 }
             }
         }
@@ -1710,7 +1724,7 @@ function Invoke-UnblockRecursive {
                 $unblocked++
             }
         }
-        catch { }
+        catch { Write-Log "Unblock error on $($item.FullName): $_" -Level "WARN" }
     }
     
     Write-Console "Unblocked $unblocked file(s) out of $total total" -Type "Success"
@@ -2645,7 +2659,6 @@ function Build-FileOpsPage {
     $null = $page.Controls.Add($unblockBtn)
     $y += 45
     
-    # Checkbox - UNCHECKED BY DEFAULT (User Request)
     $Script:TakeOwnCheck = New-Object System.Windows.Forms.CheckBox
     $Script:TakeOwnCheck.Text = "Include 'Take Ownership' step when using Force Delete"
     $Script:TakeOwnCheck.AccessibleName = "Include take ownership step with force delete"
@@ -3035,23 +3048,67 @@ function Build-RepairPage {
     $null = $page.Controls.Add($card8)
     
     $card9 = New-ToolCard -Title "Full System Repair" -Desc "DISM + SFC + CHKDSK in correct order (30-60 min)" -BtnText "Run All" -X 610 -Y $y -OnClick {
+        if (-not (Enter-Operation "Full System Repair")) { return }
         if ([System.Windows.Forms.MessageBox]::Show(
-            "Run complete repair sequence?`n`n1. DISM /RestoreHealth (15-30 min)`n2. SFC /scannow (10-15 min)`n3. CHKDSK /scan (5-10 min)`n`nTotal time: 30-60 minutes", 
-            "Full System Repair", 4, 32) -eq 6) {
-            Write-Console "=== FULL SYSTEM REPAIR SEQUENCE ===" -Type "Info"
-            Write-Console "" -Type "Normal"
-            Write-Console "Step 1/3: DISM /RestoreHealth" -Type "Info"
-            Invoke-DISMRestore
-            Write-Console "" -Type "Normal"
-            Write-Console "Step 2/3: SFC /scannow" -Type "Info"
-            Invoke-SFCScan
-            Write-Console "" -Type "Normal"
-            Write-Console "Step 3/3: CHKDSK /scan" -Type "Info"
-            Invoke-ChkdskScan -Drive "C:"
-            Write-Console "" -Type "Normal"
-            Write-Console "=== FULL REPAIR SEQUENCE COMPLETE ===" -Type "Success"
-            Write-Console "Recommend: Reboot and run SFC again to verify" -Type "Info"
+            "Run complete repair sequence?`n`n1. DISM /RestoreHealth (15-30 min)`n2. SFC /scannow (10-15 min)`n3. CHKDSK /scan (5-10 min)`n`nTotal time: 30-60 minutes",
+            "Full System Repair", 4, 32) -ne 6) {
+            Exit-Operation
+            return
         }
+        Write-Console "=== FULL SYSTEM REPAIR SEQUENCE ===" -Type "Info"
+        Write-Console "" -Type "Normal"
+        Write-Console "Step 1/3: DISM /RestoreHealth" -Type "Info"
+        Set-Status "Full Repair: DISM running..."
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = "DISM.exe"
+        $pinfo.Arguments = "/Online /Cleanup-Image /RestoreHealth"
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoWindow = $true
+        $pinfo.RedirectStandardOutput = $true
+        $dismProc = [System.Diagnostics.Process]::Start($pinfo)
+        $Script:ActiveProcess = $dismProc
+        while (-not $dismProc.HasExited) {
+            $line = $dismProc.StandardOutput.ReadLine()
+            if ($line) {
+                $line = $line.Trim()
+                if ($line -match "(\d+)\.(\d+)%") { Set-Progress -Value ([int]$matches[1]) -Maximum 100 }
+                if ($line.Length -gt 3 -and $line -notmatch "^\[=+\s*\]") { Write-Console "  $line" -Type "Normal" }
+            }
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        $Script:ActiveProcess = $null
+        Write-Console "  DISM complete" -Type "Success"
+        Write-Console "" -Type "Normal"
+        Write-Console "Step 2/3: SFC /scannow" -Type "Info"
+        Set-Status "Full Repair: SFC running..."
+        $pinfo2 = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo2.FileName = "sfc.exe"
+        $pinfo2.Arguments = "/scannow"
+        $pinfo2.UseShellExecute = $false
+        $pinfo2.CreateNoWindow = $true
+        $pinfo2.RedirectStandardOutput = $true
+        $sfcProc = [System.Diagnostics.Process]::Start($pinfo2)
+        $Script:ActiveProcess = $sfcProc
+        while (-not $sfcProc.HasExited) {
+            $line = $sfcProc.StandardOutput.ReadLine()
+            if ($line) {
+                $line = $line.Trim()
+                if ($line -match "(\d+)%") { Set-Progress -Value ([int]$matches[1]) -Maximum 100 }
+                if ($line.Length -gt 5) { Write-Console "  $line" -Type "Normal" }
+            }
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        $Script:ActiveProcess = $null
+        Write-Console "  SFC complete" -Type "Success"
+        Write-Console "" -Type "Normal"
+        Write-Console "Step 3/3: CHKDSK /scan on C:" -Type "Info"
+        Set-Status "Full Repair: CHKDSK running..."
+        Invoke-ChkdskWithProgress -Drive "C:" -Arguments "/scan"
+        Write-Console "  CHKDSK complete" -Type "Success"
+        Write-Console "" -Type "Normal"
+        Write-Console "=== FULL REPAIR SEQUENCE COMPLETE ===" -Type "Success"
+        Write-Console "Recommend: Reboot and run SFC again to verify" -Type "Info"
+        Exit-Operation
     }
     $null = $page.Controls.Add($card9)
     $y += 130

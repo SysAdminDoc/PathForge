@@ -178,3 +178,42 @@ Describe "Remove-ItemDotNet" {
         Test-Path $tmp | Should -Be $false
     }
 }
+
+Describe "Get-VolumeFileSystem" {
+    It "Returns NTFS for C: drive" {
+        $fs = Get-VolumeFileSystem -Path "C:\Windows"
+        $fs | Should -Be "NTFS"
+    }
+
+    It "Returns Unknown for UNC paths" {
+        $fs = Get-VolumeFileSystem -Path "\\server\share\folder"
+        $fs | Should -Be "Unknown"
+    }
+
+    It "Returns Unknown for empty path" {
+        $fs = Get-VolumeFileSystem -Path ""
+        $fs | Should -Be "Unknown"
+    }
+
+    It "Returns Unknown for invalid drive letter" {
+        $fs = Get-VolumeFileSystem -Path "9:\invalid"
+        $fs | Should -Be "Unknown"
+    }
+}
+
+Describe "Test-SafePath edge cases" {
+    It "Rejects path with parentheses" {
+        $result = Test-SafePath -Path 'C:\test$(calc)'
+        $result.Valid | Should -Be $false
+    }
+
+    It "Accepts path with square brackets" {
+        $result = Test-SafePath -Path "C:\test[1]\file.txt"
+        $result.Valid | Should -Be $true
+    }
+
+    It "Accepts root drive path" {
+        $result = Test-SafePath -Path "C:\"
+        $result.Valid | Should -Be $true
+    }
+}

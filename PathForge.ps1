@@ -77,6 +77,8 @@ $Script:ContentPanel = $null
 $Script:TabButtons = @{}
 $Script:Pages = @{}
 $Script:CurrentTab = ""
+$Script:OperationRunning = $false
+$Script:ActiveProcess = $null
 
 # ============================================================================
 # COLOR THEME
@@ -757,6 +759,39 @@ function Set-Progress {
         $Script:ProgressBar.Value = [Math]::Min($Value, $Maximum)
         [System.Windows.Forms.Application]::DoEvents()
     }
+}
+
+# ============================================================================
+# OPERATION GUARD
+# ============================================================================
+function Enter-Operation {
+    param([string]$Name)
+    if ($Script:OperationRunning) {
+        Write-Console "An operation is already running. Wait for it to finish or cancel." -Type "Warning"
+        return $false
+    }
+    $Script:OperationRunning = $true
+    Write-Log "Operation started: $Name"
+    return $true
+}
+
+function Exit-Operation {
+    $Script:OperationRunning = $false
+    $Script:ActiveProcess = $null
+    Set-Status "Ready"
+    Set-Progress -Value 0
+}
+
+function Stop-ActiveOperation {
+    if ($Script:ActiveProcess -and -not $Script:ActiveProcess.HasExited) {
+        try {
+            $Script:ActiveProcess.Kill()
+            Write-Console "Operation cancelled by user" -Type "Warning"
+            Write-Log "Operation cancelled by user" -Level "WARN"
+        }
+        catch { Write-Log "Failed to cancel: $_" -Level "ERROR" }
+    }
+    Exit-Operation
 }
 
 # ============================================================================
@@ -1545,7 +1580,7 @@ function Invoke-UnblockRecursive {
 # ============================================================================
 function Invoke-ChkdskWithProgress {
     param([string]$Drive, [string]$Arguments)
-    
+
     $pinfo = New-Object System.Diagnostics.ProcessStartInfo
     $pinfo.FileName = "chkdsk.exe"
     $pinfo.Arguments = "$Drive $Arguments"
@@ -1553,10 +1588,10 @@ function Invoke-ChkdskWithProgress {
     $pinfo.CreateNoWindow = $true
     $pinfo.RedirectStandardOutput = $true
     $pinfo.RedirectStandardError = $true
-    
+
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $pinfo
-    
+
     $outputHandler = {
         if ($EventArgs.Data) {
             $line = $EventArgs.Data.Trim()
@@ -1568,11 +1603,12 @@ function Invoke-ChkdskWithProgress {
             }
         }
     }
-    
+
     $process.EnableRaisingEvents = $true
     $eventJob = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
 
     $null = $process.Start()
+    $Script:ActiveProcess = $process
     $process.BeginOutputReadLine()
 
     while (-not $process.HasExited) {
@@ -1582,12 +1618,14 @@ function Invoke-ChkdskWithProgress {
 
     Unregister-Event -SourceIdentifier $eventJob.Name -ErrorAction SilentlyContinue
     Remove-Job -Job $eventJob -Force -ErrorAction SilentlyContinue
+    $Script:ActiveProcess = $null
     Set-Progress -Value 0
 }
 
 function Invoke-ChkdskScan {
     param([string]$Drive)
-    
+    if (-not (Enter-Operation "CHKDSK /scan $Drive")) { return }
+
     Write-Console "=== CHKDSK /scan on $Drive ===" -Type "Info"
     Write-Console "Online scan - no volume lock required (Windows 8+)" -Type "Normal"
     Write-Console "" -Type "Normal"
@@ -1597,12 +1635,13 @@ function Invoke-ChkdskScan {
     
     Write-Console "" -Type "Normal"
     Write-Console "CHKDSK /scan complete" -Type "Success"
-    Set-Status "Ready"
+    Exit-Operation
 }
 
 function Invoke-ChkdskFix {
     param([string]$Drive)
-    
+    if (-not (Enter-Operation "CHKDSK /F $Drive")) { return }
+
     if ($Drive -eq "C:") {
         Write-Console "System drive requires reboot for /F repair" -Type "Warning"
         Write-Console "CHKDSK needs exclusive access to C: drive" -Type "Normal"
@@ -1627,13 +1666,14 @@ function Invoke-ChkdskFix {
         
         Write-Console "" -Type "Normal"
         Write-Console "CHKDSK /F complete" -Type "Success"
-        Set-Status "Ready"
     }
+    Exit-Operation
 }
 
 function Invoke-ChkdskFull {
     param([string]$Drive)
-    
+    if (-not (Enter-Operation "CHKDSK /R $Drive")) { return }
+
     Write-Console "=== CHKDSK /R on $Drive ===" -Type "Warning"
     Write-Console "/R = Full repair including bad sector recovery" -Type "Normal"
     Write-Console "WARNING: This can take SEVERAL HOURS on large drives!" -Type "Warning"
@@ -1646,12 +1686,13 @@ function Invoke-ChkdskFull {
     
     Write-Console "" -Type "Normal"
     Write-Console "CHKDSK /R complete" -Type "Success"
-    Set-Status "Ready"
+    Exit-Operation
 }
 
 function Invoke-ChkdskSpotfix {
     param([string]$Drive)
-    
+    if (-not (Enter-Operation "CHKDSK /spotfix $Drive")) { return }
+
     Write-Console "=== CHKDSK /spotfix on $Drive ===" -Type "Info"
     Write-Console "Targeted repair of issues found by /scan (very fast)" -Type "Normal"
     Write-Console "" -Type "Normal"
@@ -1661,10 +1702,11 @@ function Invoke-ChkdskSpotfix {
     
     Write-Console "" -Type "Normal"
     Write-Console "CHKDSK /spotfix complete" -Type "Success"
-    Set-Status "Ready"
+    Exit-Operation
 }
 
 function Invoke-SFCScan {
+    if (-not (Enter-Operation "SFC /scannow")) { return }
     Write-Console "=== SFC /scannow ===" -Type "Info"
     Write-Console "System File Checker - repairs protected Windows files" -Type "Normal"
     Write-Console "Source: WinSxS component store" -Type "Normal"
@@ -1680,7 +1722,8 @@ function Invoke-SFCScan {
     $pinfo.RedirectStandardOutput = $true
     
     $process = [System.Diagnostics.Process]::Start($pinfo)
-    
+    $Script:ActiveProcess = $process
+
     while (-not $process.HasExited) {
         $line = $process.StandardOutput.ReadLine()
         if ($line) {
@@ -1695,7 +1738,8 @@ function Invoke-SFCScan {
         }
         [System.Windows.Forms.Application]::DoEvents()
     }
-    
+
+    $Script:ActiveProcess = $null
     $remaining = $process.StandardOutput.ReadToEnd()
     foreach ($line in $remaining.Split("`n")) {
         $line = $line.Trim()
@@ -1703,15 +1747,15 @@ function Invoke-SFCScan {
             Write-Console "  $line" -Type "Normal"
         }
     }
-    
+
     Write-Console "" -Type "Normal"
     Write-Console "SFC scan complete" -Type "Success"
     Write-Console "Log file: %WinDir%\Logs\CBS\CBS.log" -Type "Info"
-    Set-Status "Ready"
-    Set-Progress -Value 0
+    Exit-Operation
 }
 
 function Invoke-DISMRestore {
+    if (-not (Enter-Operation "DISM /RestoreHealth")) { return }
     Write-Console "=== DISM /Online /Cleanup-Image /RestoreHealth ===" -Type "Info"
     Write-Console "Repairs Windows component store (WinSxS)" -Type "Normal"
     Write-Console "Source: Windows Update (requires internet)" -Type "Normal"
@@ -1729,7 +1773,8 @@ function Invoke-DISMRestore {
     $pinfo.RedirectStandardOutput = $true
     
     $process = [System.Diagnostics.Process]::Start($pinfo)
-    
+    $Script:ActiveProcess = $process
+
     while (-not $process.HasExited) {
         $line = $process.StandardOutput.ReadLine()
         if ($line) {
@@ -1744,7 +1789,8 @@ function Invoke-DISMRestore {
         }
         [System.Windows.Forms.Application]::DoEvents()
     }
-    
+
+    $Script:ActiveProcess = $null
     $remaining = $process.StandardOutput.ReadToEnd()
     foreach ($line in $remaining.Split("`n")) {
         $line = $line.Trim()
@@ -1752,12 +1798,11 @@ function Invoke-DISMRestore {
             Write-Console "  $line" -Type "Normal"
         }
     }
-    
+
     Write-Console "" -Type "Normal"
     Write-Console "DISM RestoreHealth complete" -Type "Success"
     Write-Console "Log file: %WinDir%\Logs\DISM\dism.log" -Type "Info"
-    Set-Status "Ready"
-    Set-Progress -Value 0
+    Exit-Operation
 }
 
 function Get-DirtyBitStatus {
@@ -3061,6 +3106,19 @@ function Build-MainForm {
     $outputTitle.AutoSize = $true
     $null = $outputPanel.Controls.Add($outputTitle)
     
+    $cancelBtn = New-Object System.Windows.Forms.Button
+    $cancelBtn.Text = "Cancel"
+    $cancelBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $cancelBtn.ForeColor = $Script:Theme.TextPrimary
+    $cancelBtn.BackColor = $Script:Theme.Error
+    $cancelBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $cancelBtn.FlatAppearance.BorderSize = 0
+    $cancelBtn.Location = New-Object System.Drawing.Point(850, 5)
+    $cancelBtn.Size = New-Object System.Drawing.Size(60, 22)
+    $cancelBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $cancelBtn.Add_Click({ Stop-ActiveOperation })
+    $null = $outputPanel.Controls.Add($cancelBtn)
+
     $clearBtn = New-Object System.Windows.Forms.Button
     $clearBtn.Text = "Clear"
     $clearBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)

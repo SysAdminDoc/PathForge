@@ -61,13 +61,13 @@ Every major feature includes an expandable info panel explaining:
 ### Option 1: Direct Download
 ```powershell
 # Download and run
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SysAdminDoc/PathForge/refs/heads/main/PathForge.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SysAdminDoc/PathForge/main/PathForge.ps1" -OutFile "$env:TEMP\PathForge.ps1"
 & "$env:TEMP\PathForge.ps1"
 ```
 
-### Option 3: Manual
-1. Download `PathForge.ps1`
-2. Right-click → **Run with PowerShell**
+### Option 2: Manual
+1. Download `PathForge.ps1` from [Releases](https://github.com/SysAdminDoc/PathForge/releases)
+2. Right-click -> **Run with PowerShell**
 3. Accept the UAC prompt
 
 > **Note:** If you encounter execution policy restrictions:

@@ -746,6 +746,38 @@ function Set-Progress {
 }
 
 # ============================================================================
+# PATH VALIDATION
+# ============================================================================
+function Test-SafePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return @{Valid = $false; Reason = "Path is empty" }
+    }
+    if ($Path -match '[;|&`$\(\)]') {
+        return @{Valid = $false; Reason = "Path contains dangerous characters: ; | & ` $ ( )" }
+    }
+    try {
+        $resolved = [System.IO.Path]::GetFullPath($Path)
+        return @{Valid = $true; Resolved = $resolved }
+    }
+    catch {
+        return @{Valid = $false; Reason = "Invalid path format: $($_.Exception.Message)" }
+    }
+}
+
+function Get-ValidatedPath {
+    $raw = $Script:PathTextBox.Text
+    $check = Test-SafePath -Path $raw
+    if (-not $check.Valid) {
+        Write-Console "Invalid path: $($check.Reason)" -Type "Error"
+        Write-Log "Path validation failed: $raw - $($check.Reason)" -Level "ERROR"
+        Set-Status "Ready"
+        return $null
+    }
+    return $raw
+}
+
+# ============================================================================
 # DELETION METHODS (6 escalating techniques from research)
 # ============================================================================
 function Remove-ItemStandard {
@@ -776,10 +808,10 @@ function Remove-ItemLongPath {
     try {
         $longPath = "\\?\$Path"
         if (Test-Path -LiteralPath $Path -PathType Container) {
-            $null = cmd /c "rd /s /q `"$longPath`"" 2>&1
+            $proc = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
         }
         else {
-            $null = cmd /c "del /f /q `"$longPath`"" 2>&1
+            $proc = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "del /f /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
         }
         if (-not (Test-Path -LiteralPath $Path)) {
             return @{Success = $true; Method = "Long Path (\\?\)" }
@@ -823,8 +855,8 @@ function Remove-ItemRobocopy {
         $null = robocopy $emptyDir $Path /MIR /R:0 /W:0 /NFL /NDL /NJH /NJS 2>&1
         Remove-Item -Path $emptyDir -Force -ErrorAction SilentlyContinue
         
-        $null = cmd /c "rd /s /q `"$Path`"" 2>&1
-        
+        $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$Path`"" -NoNewWindow -Wait -PassThru 2>$null
+
         if (-not (Test-Path -LiteralPath $Path)) {
             return @{Success = $true; Method = "Robocopy Mirror" }
         }
@@ -881,7 +913,14 @@ function Remove-ReparsePointSafe {
 # ============================================================================
 function Invoke-ForceDelete {
     param([string]$Path, [switch]$TakeOwnership)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        Write-Log "Path rejected: $Path - $($check.Reason)" -Level "ERROR"
+        return $false
+    }
+
     Write-Console "Processing: $Path" -Type "Info"
     Write-Log "Force delete initiated: $Path"
     
@@ -969,7 +1008,13 @@ function Invoke-ForceDelete {
 # ============================================================================
 function Invoke-TakeOwnership {
     param([string]$Path)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        return $false
+    }
+
     Write-Console "Taking ownership: $Path" -Type "Info"
     Write-Console "Running: takeown /F `"$Path`" /A /R /D Y" -Type "Progress"
     Set-Status "Taking ownership..."
@@ -1006,7 +1051,13 @@ function Invoke-TakeOwnership {
 
 function Reset-ItemPermissions {
     param([string]$Path)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        return $false
+    }
+
     Write-Console "Resetting permissions to inherited defaults: $Path" -Type "Info"
     Write-Console "Running: icacls `"$Path`" /reset /T /C /Q" -Type "Progress"
     Set-Status "Resetting permissions..."
@@ -1141,7 +1192,7 @@ function Remove-OrphanedSIDs {
                 Write-Console "    Removed from ACL" -Type "Success"
             }
         }
-        catch { }
+        catch { Write-Log "ACL scan error on $($item.FullName): $_" -Level "WARN" }
     }
     
     Write-Console "Scan complete: $processed items processed, $orphaned orphaned SIDs removed" -Type "Success"
@@ -1196,7 +1247,13 @@ function Get-ACLReport {
 # ============================================================================
 function Invoke-BootTimeDelete {
     param([string]$Path)
-    
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        return $false
+    }
+
     Write-Console "Scheduling boot-time deletion using MoveFileEx API..." -Type "Info"
     Write-Console "Target: $Path" -Type "Normal"
     
@@ -1332,9 +1389,9 @@ function Invoke-ADSScanner {
                 }
             }
         }
-        catch { }
+        catch { Write-Log "ADS scan error on $($item.FullName): $_" -Level "WARN" }
     }
-    
+
     Set-Progress -Value 0
     Set-Status "Ready"
     
@@ -1567,9 +1624,9 @@ function Invoke-ChkdskFull {
     Write-Console "" -Type "Normal"
     Set-Status "CHKDSK /R running (this takes hours)..."
     
-    $args = if ($Drive -eq "C:") { "/R" } else { "/R /X" }
-    
-    Invoke-ChkdskWithProgress -Drive $Drive -Arguments $args
+    $chkdskArgs = if ($Drive -eq "C:") { "/R" } else { "/R /X" }
+
+    Invoke-ChkdskWithProgress -Drive $Drive -Arguments $chkdskArgs
     
     Write-Console "" -Type "Normal"
     Write-Console "CHKDSK /R complete" -Type "Success"
@@ -1896,7 +1953,7 @@ function Get-FilesystemEvents {
                 Write-Console "  Event ID $($eventDef.Id): $($events.Count) occurrence(s) - $($eventDef.Desc)" -Type "Warning"
             }
         }
-        catch { }
+        catch { Write-Log "Event log query failed for ID $($eventDef.Id): $_" -Level "WARN" }
     }
     
     if ($foundEvents.Count -eq 0) {
@@ -1941,7 +1998,7 @@ function New-InfoPanel {
     
     # Title
     $titleLbl = New-Object System.Windows.Forms.Label
-    $titleLbl.Text = "ℹ️ " + $info.Title
+    $titleLbl.Text = "[i] " + $info.Title
     $titleLbl.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
     $titleLbl.ForeColor = $Script:Theme.Info
     $titleLbl.Location = New-Object System.Drawing.Point(16, 10)
@@ -2196,7 +2253,7 @@ function Build-FileOpsPage {
     
     # Take Ownership Button (DEDICATED - User Request)
     $takeOwnBtn = New-Object System.Windows.Forms.Button
-    $takeOwnBtn.Text = "🔐 Take Ownership"
+    $takeOwnBtn.Text = "Take Ownership"
     $takeOwnBtn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $takeOwnBtn.ForeColor = $Script:Theme.TextPrimary
     $takeOwnBtn.BackColor = $Script:Theme.AccentDim
@@ -2218,7 +2275,7 @@ function Build-FileOpsPage {
     
     # View ACL Button
     $viewAclBtn = New-Object System.Windows.Forms.Button
-    $viewAclBtn.Text = "📋 View Permissions"
+    $viewAclBtn.Text = "View Permissions"
     $viewAclBtn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $viewAclBtn.ForeColor = $Script:Theme.TextSecondary
     $viewAclBtn.BackColor = $Script:Theme.BgTertiary
@@ -2238,7 +2295,7 @@ function Build-FileOpsPage {
     
     # Unblock Button
     $unblockBtn = New-Object System.Windows.Forms.Button
-    $unblockBtn.Text = "🔓 Unblock File"
+    $unblockBtn.Text = "Unblock File"
     $unblockBtn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $unblockBtn.ForeColor = $Script:Theme.TextSecondary
     $unblockBtn.BackColor = $Script:Theme.BgTertiary
@@ -2501,7 +2558,7 @@ function Build-RepairPage {
     $null = $warnPanel.Controls.Add($warnBar)
     
     $warnTitle = New-Object System.Windows.Forms.Label
-    $warnTitle.Text = "⚠️ Critical Repair Order: DISM → SFC → CHKDSK"
+    $warnTitle.Text = "[!] Critical Repair Order: DISM -> SFC -> CHKDSK"
     $warnTitle.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9.5)
     $warnTitle.ForeColor = $Script:Theme.Warning
     $warnTitle.Location = New-Object System.Drawing.Point(18, 8)
@@ -2729,7 +2786,7 @@ function Build-DiagnosticsPage {
     $null = $warnPanel.Controls.Add($warnBar)
     
     $warnTitle = New-Object System.Windows.Forms.Label
-    $warnTitle.Text = "🔴 SMART Warning Signs - BACKUP IMMEDIATELY if you see:"
+    $warnTitle.Text = "[!!] SMART Warning Signs - BACKUP IMMEDIATELY if you see:"
     $warnTitle.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9.5)
     $warnTitle.ForeColor = $Script:Theme.Error
     $warnTitle.Location = New-Object System.Drawing.Point(18, 8)
@@ -2901,7 +2958,7 @@ Critical Event IDs
 
 Educational Info Panels
 -----------------------
-Each section has expandable "ℹ️ Show Details" panels that explain:
+Each section has expandable "[i] Show Details" panels that explain:
   * What ACLs are and how permissions work
   * Alternate Data Streams and why they matter
   * File ownership and when to take it
@@ -2925,15 +2982,10 @@ Log Files: $($Script:Config.LogPath)
 # ============================================================================
 function Build-MainForm {
     $form = New-Object System.Windows.Forms.Form
-# codex-branding:start
-                $brandingIconPath = Join-Path $PSScriptRoot 'icon.ico'
-                if (Test-Path $brandingIconPath) {
-                    try {
-                        $form.Icon = New-Object System.Drawing.Icon($brandingIconPath)
-                    } catch {
-                    }
-                }
-                # codex-branding:end
+    $iconPath = Join-Path $PSScriptRoot 'icon.ico'
+    if (Test-Path $iconPath) {
+        try { $form.Icon = New-Object System.Drawing.Icon($iconPath) } catch { }
+    }
     $form.Text = "PathForge v$($Script:Config.Version)"
     $form.Size = New-Object System.Drawing.Size(1020, 900)
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -2952,7 +3004,7 @@ function Build-MainForm {
     $headerPanel.BackColor = $Script:Theme.BgSecondary
     
     $logo = New-Object System.Windows.Forms.Label
-    $logo.Text = "⚡ PATHFORGE"
+    $logo.Text = "PATHFORGE"
     $logo.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
     $logo.ForeColor = $Script:Theme.Accent
     $logo.Location = New-Object System.Drawing.Point(20, 12)
@@ -3068,7 +3120,7 @@ function Start-Application {
         Write-Console "PathForge v$($Script:Config.Version) initialized" -Type "Info"
         Write-Console "Log location: $Script:LogFile" -Type "Normal"
         Write-Console "" -Type "Normal"
-        Write-Console "TIP: Click 'ℹ️ Show Details' on any blue panel to learn more!" -Type "Info"
+        Write-Console "TIP: Click '[i] Show Details' on any blue panel to learn more!" -Type "Info"
     })
     
     [void]$mainForm.ShowDialog()

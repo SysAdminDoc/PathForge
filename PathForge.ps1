@@ -2149,6 +2149,8 @@ function New-ToolCard {
     
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = $BtnText
+    $btn.AccessibleName = "$Title - $BtnText"
+    $btn.AccessibleRole = [System.Windows.Forms.AccessibleRole]::PushButton
     $btn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $btn.ForeColor = $Script:Theme.TextPrimary
     $btn.BackColor = $Script:Theme.Accent
@@ -2161,7 +2163,7 @@ function New-ToolCard {
     $btn.Add_MouseLeave({ $this.BackColor = $Script:Theme.Accent })
     if ($OnClick) { $btn.Add_Click($OnClick) }
     $null = $card.Controls.Add($btn)
-    
+
     return $card
 }
 
@@ -2269,10 +2271,14 @@ function Build-FileOpsPage {
     $Script:PathTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $Script:PathTextBox.Location = New-Object System.Drawing.Point(30, $y)
     $Script:PathTextBox.Size = New-Object System.Drawing.Size(540, 26)
+    $Script:PathTextBox.AccessibleName = "Target file or folder path"
+    $Script:PathTextBox.TabIndex = 0
     $null = $page.Controls.Add($Script:PathTextBox)
     
     $browseFileBtn = New-Object System.Windows.Forms.Button
     $browseFileBtn.Text = "File..."
+    $browseFileBtn.AccessibleName = "Browse for file"
+    $browseFileBtn.TabIndex = 1
     $browseFileBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $browseFileBtn.ForeColor = $Script:Theme.TextSecondary
     $browseFileBtn.BackColor = $Script:Theme.BgTertiary
@@ -2288,6 +2294,8 @@ function Build-FileOpsPage {
     
     $browseFolderBtn = New-Object System.Windows.Forms.Button
     $browseFolderBtn.Text = "Folder..."
+    $browseFolderBtn.AccessibleName = "Browse for folder"
+    $browseFolderBtn.TabIndex = 2
     $browseFolderBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $browseFolderBtn.ForeColor = $Script:Theme.TextSecondary
     $browseFolderBtn.BackColor = $Script:Theme.BgTertiary
@@ -2315,6 +2323,8 @@ function Build-FileOpsPage {
     # Take Ownership Button (DEDICATED - User Request)
     $takeOwnBtn = New-Object System.Windows.Forms.Button
     $takeOwnBtn.Text = "Take Ownership"
+    $takeOwnBtn.AccessibleName = "Take ownership of target path"
+    $takeOwnBtn.TabIndex = 3
     $takeOwnBtn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $takeOwnBtn.ForeColor = $Script:Theme.TextPrimary
     $takeOwnBtn.BackColor = $Script:Theme.AccentDim
@@ -2337,6 +2347,8 @@ function Build-FileOpsPage {
     # View ACL Button
     $viewAclBtn = New-Object System.Windows.Forms.Button
     $viewAclBtn.Text = "View Permissions"
+    $viewAclBtn.AccessibleName = "View permissions on target path"
+    $viewAclBtn.TabIndex = 4
     $viewAclBtn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $viewAclBtn.ForeColor = $Script:Theme.TextSecondary
     $viewAclBtn.BackColor = $Script:Theme.BgTertiary
@@ -2357,6 +2369,8 @@ function Build-FileOpsPage {
     # Unblock Button
     $unblockBtn = New-Object System.Windows.Forms.Button
     $unblockBtn.Text = "Unblock File"
+    $unblockBtn.AccessibleName = "Unblock downloaded file"
+    $unblockBtn.TabIndex = 5
     $unblockBtn.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 9)
     $unblockBtn.ForeColor = $Script:Theme.TextSecondary
     $unblockBtn.BackColor = $Script:Theme.BgTertiary
@@ -2378,11 +2392,13 @@ function Build-FileOpsPage {
     # Checkbox - UNCHECKED BY DEFAULT (User Request)
     $Script:TakeOwnCheck = New-Object System.Windows.Forms.CheckBox
     $Script:TakeOwnCheck.Text = "Include 'Take Ownership' step when using Force Delete"
+    $Script:TakeOwnCheck.AccessibleName = "Include take ownership step with force delete"
+    $Script:TakeOwnCheck.TabIndex = 6
     $Script:TakeOwnCheck.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $Script:TakeOwnCheck.ForeColor = $Script:Theme.TextSecondary
     $Script:TakeOwnCheck.Location = New-Object System.Drawing.Point(30, $y)
     $Script:TakeOwnCheck.Size = New-Object System.Drawing.Size(500, 22)
-    $Script:TakeOwnCheck.Checked = $false  # UNCHECKED BY DEFAULT
+    $Script:TakeOwnCheck.Checked = $false
     $null = $page.Controls.Add($Script:TakeOwnCheck)
     $y += 35
     
@@ -2653,6 +2669,8 @@ function Build-RepairPage {
     $Script:DriveCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
     $Script:DriveCombo.Location = New-Object System.Drawing.Point(30, $y)
     $Script:DriveCombo.Size = New-Object System.Drawing.Size(350, 26)
+    $Script:DriveCombo.AccessibleName = "Select drive for repair operations"
+    $Script:DriveCombo.TabIndex = 0
     Get-Volume | Where-Object { $_.DriveLetter -and $_.DriveType -eq 'Fixed' } | ForEach-Object {
         $null = $Script:DriveCombo.Items.Add("$($_.DriveLetter): $($_.FileSystemLabel) ($($_.FileSystem), $([math]::Round($_.Size/1GB))GB)")
     }

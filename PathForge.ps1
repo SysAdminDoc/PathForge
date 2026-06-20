@@ -1362,6 +1362,71 @@ function Get-ACLReport {
     }
 }
 
+function Export-ACLReport {
+    param([string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        return
+    }
+
+    Write-Console "Exporting ACL report for: $Path" -Type "Info"
+    Set-Status "Exporting permissions..."
+
+    try {
+        $items = @(Get-Item -LiteralPath $Path -Force)
+        if (Test-Path -LiteralPath $Path -PathType Container) {
+            $items += Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $rows = @()
+        $total = $items.Count
+        $processed = 0
+
+        foreach ($item in $items) {
+            $processed++
+            if ($processed % 50 -eq 0) {
+                Set-Progress -Value $processed -Maximum $total
+                Set-Status "Exporting $processed/$total..."
+            }
+            try {
+                $acl = Get-Acl -LiteralPath $item.FullName -ErrorAction Stop
+                foreach ($ace in $acl.Access) {
+                    $rows += [PSCustomObject]@{
+                        Path = $item.FullName
+                        Owner = $acl.Owner
+                        Identity = $ace.IdentityReference.Value
+                        AccessType = $ace.AccessControlType.ToString()
+                        Rights = $ace.FileSystemRights.ToString()
+                        Inherited = $ace.IsInherited
+                        InheritanceFlags = $ace.InheritanceFlags.ToString()
+                        PropagationFlags = $ace.PropagationFlags.ToString()
+                    }
+                }
+            }
+            catch { Write-Log "ACL export error on $($item.FullName): $_" -Level "WARN" }
+        }
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $csvPath = Join-Path $Script:Config.LogPath "ACL_Report_$timestamp.csv"
+        if (-not (Test-Path $Script:Config.LogPath)) {
+            New-Item -Path $Script:Config.LogPath -ItemType Directory -Force | Out-Null
+        }
+        $rows | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+
+        Write-Console "ACL report exported: $csvPath" -Type "Success"
+        Write-Console "Entries: $($rows.Count) ACEs from $total items" -Type "Info"
+        Set-Status "Ready"
+        Set-Progress -Value 0
+    }
+    catch {
+        Write-Console "Export failed: $_" -Type "Error"
+        Set-Status "Ready"
+        Set-Progress -Value 0
+    }
+}
+
 # ============================================================================
 # BOOT-TIME DELETION
 # ============================================================================
@@ -1955,6 +2020,74 @@ function Set-DirtyBit {
     catch {
         Write-Console "Failed: $_" -Type "Error"
     }
+}
+
+function Reset-WindowsUpdate {
+    if (-not (Enter-Operation "Windows Update Reset")) { return }
+    Write-Console "=== Windows Update Component Reset ===" -Type "Info"
+    Write-Console "Stopping services, clearing caches, re-registering DLLs..." -Type "Normal"
+    Write-Console "" -Type "Normal"
+
+    $services = @('bits', 'wuauserv', 'appidsvc', 'cryptsvc')
+    foreach ($svc in $services) {
+        Write-Console "  Stopping $svc..." -Type "Progress"
+        $null = sc.exe stop $svc 2>&1
+    }
+
+    $sdPath = "$env:SystemRoot\SoftwareDistribution"
+    $crPath = "$env:SystemRoot\System32\catroot2"
+    $backupSuffix = ".bak_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+    try {
+        if (Test-Path $sdPath) {
+            Rename-Item -LiteralPath $sdPath -NewName "SoftwareDistribution$backupSuffix" -Force -ErrorAction Stop
+            Write-Console "  Renamed SoftwareDistribution -> SoftwareDistribution$backupSuffix" -Type "Success"
+        }
+        if (Test-Path $crPath) {
+            Rename-Item -LiteralPath $crPath -NewName "catroot2$backupSuffix" -Force -ErrorAction Stop
+            Write-Console "  Renamed catroot2 -> catroot2$backupSuffix" -Type "Success"
+        }
+    }
+    catch {
+        Write-Console "  Failed to rename cache folders: $_" -Type "Error"
+        Write-Console "  Rolling back -- restarting services..." -Type "Warning"
+        foreach ($svc in $services) { $null = sc.exe start $svc 2>&1 }
+        Exit-Operation
+        return
+    }
+
+    $dlls = @(
+        'atl.dll', 'urlmon.dll', 'mshtml.dll', 'shdocvw.dll',
+        'browseui.dll', 'jscript.dll', 'vbscript.dll', 'scrrun.dll',
+        'msxml.dll', 'msxml3.dll', 'msxml6.dll', 'actxprxy.dll',
+        'softpub.dll', 'wintrust.dll', 'dssenh.dll', 'rsaenh.dll',
+        'gpkcsp.dll', 'sccbase.dll', 'slbcsp.dll', 'cryptdlg.dll',
+        'oleaut32.dll', 'ole32.dll', 'shell32.dll', 'initpki.dll',
+        'wuapi.dll', 'wuaueng.dll', 'wuaueng1.dll', 'wucltui.dll',
+        'wups.dll', 'wups2.dll', 'wuweb.dll', 'qmgr.dll', 'qmgrprxy.dll',
+        'wucltux.dll', 'muweb.dll', 'wuwebv.dll'
+    )
+
+    Write-Console "  Re-registering $($dlls.Count) DLLs..." -Type "Progress"
+    foreach ($dll in $dlls) {
+        $null = regsvr32.exe /s $dll 2>&1
+    }
+    Write-Console "  DLL registration complete" -Type "Success"
+
+    Write-Console "  Resetting Winsock..." -Type "Progress"
+    $null = netsh winsock reset 2>&1
+    $null = netsh winhttp reset proxy 2>&1
+
+    foreach ($svc in $services) {
+        Write-Console "  Starting $svc..." -Type "Progress"
+        $null = sc.exe start $svc 2>&1
+    }
+
+    Write-Console "" -Type "Normal"
+    Write-Console "Windows Update components reset successfully" -Type "Success"
+    Write-Console "Backups saved with suffix: $backupSuffix" -Type "Info"
+    Write-Console "Reboot recommended, then try Windows Update again" -Type "Info"
+    Exit-Operation
 }
 
 function Get-NTFSSelfHealingStatus {
@@ -2668,8 +2801,17 @@ function Build-FileOpsPage {
         }
     }
     $null = $page.Controls.Add($card7)
+
+    $card7b = New-ToolCard -Title "Export ACL Report" -Desc "Export permissions to CSV for auditing (recursive)" -BtnText "Export CSV" -X 320 -Y $y -OnClick {
+        if ([string]::IsNullOrWhiteSpace($Script:PathTextBox.Text)) {
+            [System.Windows.Forms.MessageBox]::Show("Enter a path first.", "No Path", 0, 48) | Out-Null
+            return
+        }
+        Export-ACLReport -Path $Script:PathTextBox.Text
+    }
+    $null = $page.Controls.Add($card7b)
     $y += 130
-    
+
     # Section: Alternate Data Streams
     $secLbl4 = New-Object System.Windows.Forms.Label
     $secLbl4.Text = "ALTERNATE DATA STREAMS (ADS)"
@@ -2953,9 +3095,29 @@ function Build-RepairPage {
     $healInfo = New-InfoPanel -Key "NTFSSelfHealing" -X 30 -Y $y -Width 900
     if ($healInfo) {
         $null = $page.Controls.Add($healInfo)
-        $y += $healInfo.Height + 30
+        $y += $healInfo.Height + 15
     }
-    
+
+    # Windows Update Reset
+    $secLbl4 = New-Object System.Windows.Forms.Label
+    $secLbl4.Text = "WINDOWS UPDATE"
+    $secLbl4.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 8)
+    $secLbl4.ForeColor = $Script:Theme.TextMuted
+    $secLbl4.Location = New-Object System.Drawing.Point(30, $y)
+    $secLbl4.AutoSize = $true
+    $null = $page.Controls.Add($secLbl4)
+    $y += 23
+
+    $card13 = New-ToolCard -Title "Reset Windows Update" -Desc "Stop services, clear caches, re-register DLLs, restart" -BtnText "Reset Components" -X 30 -Y $y -OnClick {
+        if ([System.Windows.Forms.MessageBox]::Show(
+            "Reset Windows Update components?`n`nThis will:`n- Stop BITS, wuauserv, cryptsvc`n- Rename SoftwareDistribution and catroot2`n- Re-register 36 DLLs`n- Reset Winsock`n- Restart services`n`nA reboot is recommended afterward.",
+            "Confirm Reset", 4, 48) -eq 6) {
+            Reset-WindowsUpdate
+        }
+    }
+    $null = $page.Controls.Add($card13)
+    $y += 130
+
     return $page
 }
 

@@ -1741,15 +1741,29 @@ function Invoke-SFCScan {
 
     $Script:ActiveProcess = $null
     $remaining = $process.StandardOutput.ReadToEnd()
+    $sfcFailed = $false
     foreach ($line in $remaining.Split("`n")) {
         $line = $line.Trim()
         if ($line.Length -gt 5) {
             Write-Console "  $line" -Type "Normal"
+            if ($line -match "unable to fix|could not.*repair|corrupt.*files" -and $line -notmatch "no integrity") {
+                $sfcFailed = $true
+            }
         }
     }
 
     Write-Console "" -Type "Normal"
-    Write-Console "SFC scan complete" -Type "Success"
+    if ($sfcFailed) {
+        Write-Console "SFC found issues it could not repair" -Type "Warning"
+        Write-Console "" -Type "Normal"
+        Write-Console "NEXT STEPS:" -Type "Info"
+        Write-Console "  1. Run DISM /RestoreHealth first to repair the component store" -Type "Info"
+        Write-Console "  2. Then re-run SFC /scannow" -Type "Info"
+        Write-Console "  3. Check details in: %WinDir%\Logs\CBS\CBS.log" -Type "Info"
+    }
+    else {
+        Write-Console "SFC scan complete" -Type "Success"
+    }
     Write-Console "Log file: %WinDir%\Logs\CBS\CBS.log" -Type "Info"
     Exit-Operation
 }
@@ -1774,17 +1788,39 @@ function Invoke-DISMRestore {
     
     $process = [System.Diagnostics.Process]::Start($pinfo)
     $Script:ActiveProcess = $process
+    $lastProgressTime = Get-Date
+    $lastPct = -1
+    $stallWarned = $false
 
     while (-not $process.HasExited) {
         $line = $process.StandardOutput.ReadLine()
         if ($line) {
             $line = $line.Trim()
             if ($line -match "(\d+)\.(\d+)%") {
-                Set-Progress -Value ([int]$matches[1]) -Maximum 100
+                $currentPct = [int]$matches[1]
+                if ($currentPct -ne $lastPct) {
+                    $lastPct = $currentPct
+                    $lastProgressTime = Get-Date
+                    $stallWarned = $false
+                }
+                Set-Progress -Value $currentPct -Maximum 100
                 Set-Status "DISM running... $($matches[0])"
             }
             if ($line.Length -gt 3 -and $line -notmatch "^\[=+\s*\]") {
                 Write-Console "  $line" -Type "Normal"
+            }
+        }
+        else {
+            $stallSeconds = ((Get-Date) - $lastProgressTime).TotalSeconds
+            if ($stallSeconds -gt 60 -and -not $stallWarned) {
+                $stallWarned = $true
+                if ($lastPct -ge 60 -and $lastPct -le 65) {
+                    Write-Console "  [NORMAL] DISM often stalls near 62% on Win11 24H2 -- this is a known behavior, not a hang" -Type "Info"
+                }
+                else {
+                    Write-Console "  [NORMAL] DISM is still working -- progress may pause for several minutes at certain stages" -Type "Info"
+                }
+                Write-Console "  Do NOT cancel unless you are certain the process has stopped" -Type "Warning"
             }
         }
         [System.Windows.Forms.Application]::DoEvents()
@@ -1942,10 +1978,19 @@ function Get-DriveHealth {
     try {
         Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue | ForEach-Object {
             Write-Console "  Device: $($_.DeviceId)" -Type "Info"
-            Write-Console "    Read Errors: $($_.ReadErrorsTotal)" -Type $(if ($_.ReadErrorsTotal -gt 0) { "Warning" } else { "Normal" })
-            Write-Console "    Write Errors: $($_.WriteErrorsTotal)" -Type $(if ($_.WriteErrorsTotal -gt 0) { "Warning" } else { "Normal" })
-            Write-Console "    Temperature: $($_.Temperature)°C" -Type $(if ($_.Temperature -gt 50) { "Warning" } else { "Normal" })
-            Write-Console "    Wear: $($_.Wear)" -Type "Normal"
+            Write-Console "    Read Errors: $($_.ReadErrorsTotal) (Uncorrected: $($_.ReadErrorsUncorrected))" -Type $(if ($_.ReadErrorsUncorrected -gt 0) { "Error" } elseif ($_.ReadErrorsTotal -gt 0) { "Warning" } else { "Normal" })
+            Write-Console "    Write Errors: $($_.WriteErrorsTotal) (Uncorrected: $($_.WriteErrorsUncorrected))" -Type $(if ($_.WriteErrorsUncorrected -gt 0) { "Error" } elseif ($_.WriteErrorsTotal -gt 0) { "Warning" } else { "Normal" })
+            $tempC = $_.Temperature
+            Write-Console "    Temperature: ${tempC}C" -Type $(if ($tempC -gt 55) { "Error" } elseif ($tempC -gt 45) { "Warning" } else { "Normal" })
+            $wearPct = $_.Wear
+            Write-Console "    Wear: ${wearPct}%" -Type $(if ($wearPct -gt 80) { "Error" } elseif ($wearPct -gt 50) { "Warning" } else { "Normal" })
+            Write-Console "    Power-On Hours: $($_.PowerOnHours)" -Type "Normal"
+            if ($_.ReadLatencyMax -gt 0) {
+                Write-Console "    Max Read Latency: $($_.ReadLatencyMax) ms" -Type $(if ($_.ReadLatencyMax -gt 10000) { "Error" } elseif ($_.ReadLatencyMax -gt 1000) { "Warning" } else { "Normal" })
+            }
+            if ($_.WriteLatencyMax -gt 0) {
+                Write-Console "    Max Write Latency: $($_.WriteLatencyMax) ms" -Type $(if ($_.WriteLatencyMax -gt 10000) { "Error" } elseif ($_.WriteLatencyMax -gt 1000) { "Warning" } else { "Normal" })
+            }
         }
     }
     catch {

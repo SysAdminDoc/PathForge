@@ -42,6 +42,9 @@ public class DarkMode {
 }
 "@ -ErrorAction SilentlyContinue
 
+# Recycle Bin support
+Add-Type -AssemblyName Microsoft.VisualBasic
+
 # Boot-time deletion API (MoveFileEx)
 Add-Type -TypeDefinition @"
 using System;
@@ -79,6 +82,7 @@ $Script:Pages = @{}
 $Script:CurrentTab = ""
 $Script:OperationRunning = $false
 $Script:ActiveProcess = $null
+$Script:RecycleBinCheck = $null
 
 # ============================================================================
 # COLOR THEME
@@ -826,6 +830,43 @@ function Get-ValidatedPath {
     return $raw
 }
 
+function Get-VolumeFileSystem {
+    param([string]$Path)
+    try {
+        $root = [System.IO.Path]::GetPathRoot($Path)
+        $letter = $root.TrimEnd('\', '/')
+        $vol = Get-Volume -DriveLetter $letter[0] -ErrorAction SilentlyContinue
+        if ($vol) { return $vol.FileSystem }
+    }
+    catch { }
+    return "Unknown"
+}
+
+# ============================================================================
+# RECYCLE BIN
+# ============================================================================
+function Move-ToRecycleBin {
+    param([string]$Path)
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Container) {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+                $Path,
+                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+        }
+        else {
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
+                $Path,
+                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
+        }
+        return @{Success = $true; Method = "Recycle Bin" }
+    }
+    catch {
+        return @{Success = $false; Error = $_.Exception.Message }
+    }
+}
+
 # ============================================================================
 # DELETION METHODS (6 escalating techniques from research)
 # ============================================================================
@@ -972,12 +1013,24 @@ function Invoke-ForceDelete {
 
     Write-Console "Processing: $Path" -Type "Info"
     Write-Log "Force delete initiated: $Path"
-    
+
     if (-not (Test-Path -LiteralPath $Path) -and -not (Test-Path -LiteralPath "\\?\$Path")) {
         Write-Console "Path not found" -Type "Error"
         return $false
     }
-    
+
+    if ($Script:RecycleBinCheck -and $Script:RecycleBinCheck.Checked) {
+        Write-Console "  Attempting Recycle Bin (recoverable)..." -Type "Progress"
+        $rbResult = Move-ToRecycleBin -Path $Path
+        if ($rbResult.Success) {
+            Write-Console "SUCCESS via Recycle Bin (recoverable from trash)" -Type "Success"
+            Write-Log "Recycle Bin success: $Path" -Level "SUCCESS"
+            Set-Status "Ready"
+            return $true
+        }
+        Write-Console "  Recycle Bin failed: $($rbResult.Error) -- escalating to permanent delete" -Type "Warning"
+    }
+
     if (Test-ReparsePoint -Path $Path) {
         Write-Console "Detected symbolic link or junction point" -Type "Warning"
         $result = [System.Windows.Forms.MessageBox]::Show(
@@ -1006,11 +1059,18 @@ function Invoke-ForceDelete {
         Write-Console "Ownership claimed, permissions granted" -Type "Success"
     }
     
+    $fs = Get-VolumeFileSystem -Path $Path
     $methods = @(
         @{Name = "Standard PowerShell"; Func = "Remove-ItemStandard" },
         @{Name = ".NET Framework"; Func = "Remove-ItemDotNet" },
-        @{Name = "Long Path (\\?\)"; Func = "Remove-ItemLongPath" },
-        @{Name = "8.3 Short Name"; Func = "Remove-ItemShortName" },
+        @{Name = "Long Path (\\?\)"; Func = "Remove-ItemLongPath" })
+    if ($fs -eq "NTFS") {
+        $methods += @{Name = "8.3 Short Name"; Func = "Remove-ItemShortName" }
+    }
+    elseif ($fs -ne "Unknown") {
+        Write-Console "  Skipping 8.3 Short Name method ($fs does not support short names)" -Type "Normal"
+    }
+    $methods += @(
         @{Name = "Robocopy Mirror"; Func = "Remove-ItemRobocopy" },
         @{Name = "WMI/CIM"; Func = "Remove-ItemWMI" }
     )
@@ -1403,11 +1463,18 @@ function Clear-PendingDeletions {
 # ============================================================================
 function Invoke-ADSScanner {
     param([string]$Path)
-    
+
+    $fs = Get-VolumeFileSystem -Path $Path
+    if ($fs -ne "NTFS" -and $fs -ne "Unknown") {
+        Write-Console "Alternate Data Streams are an NTFS-only feature" -Type "Warning"
+        Write-Console "This path is on a $fs volume -- ADS scanning is not applicable" -Type "Info"
+        return @()
+    }
+
     Write-Console "Scanning for Alternate Data Streams..." -Type "Info"
     Write-Console "Looking for hidden data attached to files (NTFS feature)" -Type "Normal"
     Set-Status "Scanning for ADS..."
-    
+
     $items = @(Get-Item -LiteralPath $Path -Force)
     if (Test-Path -LiteralPath $Path -PathType Container) {
         $items += Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
@@ -2445,8 +2512,20 @@ function Build-FileOpsPage {
     $Script:TakeOwnCheck.Size = New-Object System.Drawing.Size(500, 22)
     $Script:TakeOwnCheck.Checked = $false
     $null = $page.Controls.Add($Script:TakeOwnCheck)
+    $y += 28
+
+    $Script:RecycleBinCheck = New-Object System.Windows.Forms.CheckBox
+    $Script:RecycleBinCheck.Text = "Try Recycle Bin first (recoverable delete before permanent)"
+    $Script:RecycleBinCheck.AccessibleName = "Try Recycle Bin before permanent delete"
+    $Script:RecycleBinCheck.TabIndex = 7
+    $Script:RecycleBinCheck.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $Script:RecycleBinCheck.ForeColor = $Script:Theme.TextSecondary
+    $Script:RecycleBinCheck.Location = New-Object System.Drawing.Point(30, $y)
+    $Script:RecycleBinCheck.Size = New-Object System.Drawing.Size(500, 22)
+    $Script:RecycleBinCheck.Checked = $true
+    $null = $page.Controls.Add($Script:RecycleBinCheck)
     $y += 35
-    
+
     # ========== ACL INFO PANEL ==========
     $aclInfo = New-InfoPanel -Key "ACL" -X 30 -Y $y -Width 900
     if ($aclInfo) {

@@ -545,6 +545,218 @@ function Get-PathForgeDeletionPlan {
     }
 }
 
+function ConvertTo-PathForgeBoolean {
+    param(
+        [object]$Value,
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return $Default
+    }
+    if ($Value -is [bool]) {
+        return [bool]$Value
+    }
+
+    switch (([string]$Value).Trim().ToLowerInvariant()) {
+        { $_ -in @('1', 'true', 'yes', 'y', 'on') } { return $true }
+        { $_ -in @('0', 'false', 'no', 'n', 'off') } { return $false }
+        default { throw "Unsupported Boolean value: $Value" }
+    }
+}
+
+function Resolve-PathForgeDeletionMethod {
+    param([string]$Method)
+
+    if ([string]::IsNullOrWhiteSpace($Method)) {
+        return 'Auto'
+    }
+
+    $key = $Method.Trim().ToLowerInvariant() -replace '[\s._-]', ''
+    $aliases = @{
+        auto          = 'Auto'
+        standard      = 'Standard'
+        powershell    = 'Standard'
+        dotnet        = 'DotNet'
+        framework     = 'DotNet'
+        longpath      = 'LongPath'
+        shortname     = 'ShortName'
+        eightdotthree = 'ShortName'
+        robocopy      = 'Robocopy'
+        wmi           = 'WMI'
+        cim           = 'WMI'
+        recyclebin    = 'RecycleBin'
+        recycle       = 'RecycleBin'
+        boottime      = 'BootTime'
+        boot          = 'BootTime'
+        reparsepoint  = 'ReparsePoint'
+        reparse       = 'ReparsePoint'
+        linkonly      = 'ReparsePoint'
+    }
+
+    if (-not $aliases.ContainsKey($key)) {
+        throw "Unsupported deletion method '$Method'. Use Auto, Standard, DotNet, LongPath, ShortName, Robocopy, WMI, RecycleBin, BootTime, or ReparsePoint."
+    }
+    return $aliases[$key]
+}
+
+function Import-PathForgeDeletionBatch {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Batch file not found: $Path"
+    }
+
+    $extension = [System.IO.Path]::GetExtension($Path)
+    $records = New-Object 'System.Collections.Generic.List[object]'
+
+    if ($extension -ieq '.csv') {
+        $rows = @(Import-Csv -LiteralPath $Path)
+        for ($index = 0; $index -lt $rows.Count; $index++) {
+            $row = $rows[$index]
+            $lineNumber = $index + 2
+            $rawPath = if ($row.PSObject.Properties.Name -contains 'Path') { [string]$row.Path } else { $null }
+            $rawMethod = if ($row.PSObject.Properties.Name -contains 'Method') { [string]$row.Method } else { 'Auto' }
+            $rawDryRun = if ($row.PSObject.Properties.Name -contains 'DryRun') { $row.DryRun } else { $false }
+
+            $errorParts = New-Object 'System.Collections.Generic.List[string]'
+            try { $method = Resolve-PathForgeDeletionMethod -Method $rawMethod }
+            catch { $method = 'Auto'; $errorParts.Add($_.Exception.Message) }
+            try { $dryRun = ConvertTo-PathForgeBoolean -Value $rawDryRun }
+            catch { $dryRun = $false; $errorParts.Add($_.Exception.Message) }
+            $pathCheck = Test-SafePath -Path $rawPath
+            if (-not $pathCheck.Valid) {
+                $errorParts.Add($pathCheck.Reason)
+            }
+            $errorMessage = $errorParts -join '; '
+
+            $records.Add([PSCustomObject]@{
+                    LineNumber = $lineNumber
+                    Path       = $rawPath
+                    Method     = $method
+                    DryRun     = $dryRun
+                    Valid      = [string]::IsNullOrWhiteSpace($errorMessage)
+                    Error      = $errorMessage
+                })
+        }
+    }
+    else {
+        $lines = @(Get-Content -LiteralPath $Path)
+        for ($index = 0; $index -lt $lines.Count; $index++) {
+            $line = [string]$lines[$index]
+            if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith('#')) {
+                continue
+            }
+
+            $parts = $line -split '\|', 3
+            $rawPath = $parts[0].Trim()
+            $rawMethod = if ($parts.Count -ge 2) { $parts[1].Trim() } else { 'Auto' }
+            $rawDryRun = if ($parts.Count -ge 3) { $parts[2].Trim() } else { $false }
+            $errorParts = New-Object 'System.Collections.Generic.List[string]'
+            try { $method = Resolve-PathForgeDeletionMethod -Method $rawMethod }
+            catch { $method = 'Auto'; $errorParts.Add($_.Exception.Message) }
+            try { $dryRun = ConvertTo-PathForgeBoolean -Value $rawDryRun }
+            catch { $dryRun = $false; $errorParts.Add($_.Exception.Message) }
+            $pathCheck = Test-SafePath -Path $rawPath
+            if (-not $pathCheck.Valid) {
+                $errorParts.Add($pathCheck.Reason)
+            }
+            $errorMessage = $errorParts -join '; '
+
+            $records.Add([PSCustomObject]@{
+                    LineNumber = $index + 1
+                    Path       = $rawPath
+                    Method     = $method
+                    DryRun     = $dryRun
+                    Valid      = [string]::IsNullOrWhiteSpace($errorMessage)
+                    Error      = $errorMessage
+                })
+        }
+    }
+
+    return $records.ToArray()
+}
+
+function Invoke-PathForgeDeletionMethod {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]
+        [ValidateSet('Auto', 'Standard', 'DotNet', 'LongPath', 'ShortName', 'Robocopy', 'WMI', 'RecycleBin', 'BootTime', 'ReparsePoint')]
+        [string]$Method,
+        [switch]$IncludeRecycleBin
+    )
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Method = $Method; EffectiveMethod = $null; Attempts = @(); Error = $check.Reason }
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Method = $Method; EffectiveMethod = $null; Attempts = @(); Error = 'Path not found' }
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($Path, "Delete with PathForge method $Method")) {
+        return [PSCustomObject]@{Success = $true; Simulated = $true; Path = $Path; Method = $Method; EffectiveMethod = $Method; Attempts = @(); Error = $null }
+    }
+
+    $methodCommands = @{
+        Standard     = 'Remove-ItemStandard'
+        DotNet       = 'Remove-ItemDotNet'
+        LongPath     = 'Remove-ItemLongPath'
+        ShortName    = 'Remove-ItemShortName'
+        Robocopy     = 'Remove-ItemRobocopy'
+        WMI          = 'Remove-ItemWMI'
+        RecycleBin   = 'Move-ToRecycleBin'
+        BootTime     = 'Register-BootTimeDelete'
+        ReparsePoint = 'Remove-ReparsePointSafe'
+    }
+
+    if ($Method -ne 'Auto') {
+        $commandName = $methodCommands[$Method]
+        $rawResult = & $commandName -Path $Path -Confirm:$false
+        if ($Method -eq 'ReparsePoint') {
+            $rawResult = if ($rawResult) { @{Success = $true; Method = 'Reparse Point Removal'} } else { @{Success = $false; Error = 'Target is not a removable reparse point'} }
+        }
+        return [PSCustomObject]@{
+            Success         = [bool]$rawResult.Success
+            Simulated       = [bool]$rawResult.Simulated
+            Path            = $Path
+            Method          = $Method
+            EffectiveMethod = $rawResult.Method
+            Attempts        = @([PSCustomObject]@{Method = $Method; Success = [bool]$rawResult.Success; Error = $rawResult.Error })
+            Error           = $rawResult.Error
+        }
+    }
+
+    $attemptNames = New-Object 'System.Collections.Generic.List[string]'
+    if ($IncludeRecycleBin) { $attemptNames.Add('RecycleBin') }
+    if (Test-ReparsePoint -Path $Path) {
+        $attemptNames.Add('ReparsePoint')
+    }
+    else {
+        foreach ($attemptName in @('Standard', 'DotNet', 'LongPath')) { $attemptNames.Add($attemptName) }
+        if ((Get-VolumeFileSystem -Path $Path) -eq 'NTFS') { $attemptNames.Add('ShortName') }
+        if (Test-Path -LiteralPath $Path -PathType Container) { $attemptNames.Add('Robocopy') }
+        $attemptNames.Add('WMI')
+    }
+
+    $attempts = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($attemptName in $attemptNames) {
+        $commandName = $methodCommands[$attemptName]
+        $rawResult = & $commandName -Path $Path -Confirm:$false
+        if ($attemptName -eq 'ReparsePoint') {
+            $rawResult = if ($rawResult) { @{Success = $true; Method = 'Reparse Point Removal'} } else { @{Success = $false; Error = 'Reparse-point removal failed'} }
+        }
+        $attempts.Add([PSCustomObject]@{Method = $attemptName; Success = [bool]$rawResult.Success; Error = $rawResult.Error })
+        if ($rawResult.Success) {
+            return [PSCustomObject]@{Success = $true; Simulated = $false; Path = $Path; Method = 'Auto'; EffectiveMethod = $rawResult.Method; Attempts = $attempts.ToArray(); Error = $null }
+        }
+    }
+
+    return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Method = 'Auto'; EffectiveMethod = $null; Attempts = $attempts.ToArray(); Error = 'All applicable immediate methods failed' }
+}
+
 function Get-DriveSmartHealth {
     [CmdletBinding()]
     param([string]$Drive)
@@ -1000,6 +1212,8 @@ Export-ModuleMember -Function @(
     'Remove-ReparsePointSafe',
     'Register-BootTimeDelete',
     'Get-PathForgeDeletionPlan',
+    'Import-PathForgeDeletionBatch',
+    'Invoke-PathForgeDeletionMethod',
     'Get-DriveSmartHealth',
     'Get-VolumeCorruptionRecord',
     'Get-PathForgeRepairCommand',

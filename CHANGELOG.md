@@ -13,6 +13,7 @@ All notable changes to PathForge will be documented in this file.
 - Reusable `PathForge.Core.psm1` module for deletion, repair-process, and storage-diagnostic operations
 - Explorer drag-and-drop support for the target path field
 - Non-mutating deletion dry-run plans with target counts, sample paths, and per-method API applicability
+- CSV and text deletion batches with per-row method selection, validation, dry-run, and single-confirmation execution
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation

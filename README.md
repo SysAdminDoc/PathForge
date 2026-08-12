@@ -110,6 +110,19 @@ If all methods fail, use **Schedule Boot-Time Deletion** — the file will be re
 
 Enable **Dry-run only** to inventory the target, preview a bounded sample, and see which deletion API would run at each escalation step without changing files, ownership, links, the Recycle Bin, or the reboot queue.
 
+### Batch Deletion
+
+Use **Batch Delete** to load either CSV or plain text. CSV supports `Path`, `Method`, and optional `DryRun` columns:
+
+```csv
+Path,Method,DryRun
+C:\Temp\old.log,Standard,true
+C:\Temp\locked-folder,Robocopy,false
+C:\Temp\remove-at-boot.sys,BootTime,false
+```
+
+Text files use `path|method|dry-run`; method and dry-run are optional. Supported methods are `Auto`, `Standard`, `DotNet`, `LongPath`, `ShortName`, `Robocopy`, `WMI`, `RecycleBin`, `BootTime`, and `ReparsePoint`. PathForge previews every row and asks once before processing any mutating row.
+
 ### Repair Sequence
 For corrupted systems, run repairs in this order:
 

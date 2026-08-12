@@ -10,6 +10,7 @@ BeforeAll {
     $functionNames = @(
         'Get-ValidatedPath', 'Receive-PathDrop', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
         'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth', 'Invoke-ForceDelete', 'Invoke-BootTimeDelete',
+        'Invoke-DeletionBatch',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
         'Set-Status', 'Set-Progress',
         'Enter-Operation', 'Exit-Operation', 'Stop-ActiveOperation'
@@ -182,6 +183,57 @@ Describe "PathForge.Core module boundary" {
         ($plan.Methods | Where-Object Name -eq 'Recycle Bin').Applicable | Should -BeTrue
         ($plan.Methods | Where-Object Name -eq 'Robocopy Mirror').Applicable | Should -BeTrue
         Test-Path -LiteralPath $childFile | Should -BeTrue
+    }
+
+    It "imports CSV batch rows with canonical methods and validation" {
+        $batchPath = Join-Path $TestDrive 'delete-batch.csv'
+        @(
+            'Path,Method,DryRun',
+            'C:\Temp\one.txt,dotnet,true',
+            'C:\Temp\two.txt,boot,false',
+            'C:\Temp\three.txt,unsupported,false'
+        ) | Set-Content -LiteralPath $batchPath
+
+        $records = @(Import-PathForgeDeletionBatch -Path $batchPath)
+
+        $records.Count | Should -Be 3
+        $records[0].Method | Should -Be 'DotNet'
+        $records[0].DryRun | Should -BeTrue
+        $records[1].Method | Should -Be 'BootTime'
+        $records[2].Valid | Should -BeFalse
+        $records[2].Error | Should -Match 'Unsupported deletion method'
+    }
+
+    It "imports text rows as path, method, and optional dry-run fields" {
+        $batchPath = Join-Path $TestDrive 'delete-batch.txt'
+        @(
+            '# PathForge batch',
+            'C:\Temp\one.txt|powershell|yes',
+            'C:\Temp\two.txt'
+        ) | Set-Content -LiteralPath $batchPath
+
+        $records = @(Import-PathForgeDeletionBatch -Path $batchPath)
+
+        $records.Count | Should -Be 2
+        $records[0].Method | Should -Be 'Standard'
+        $records[0].DryRun | Should -BeTrue
+        $records[1].Method | Should -Be 'Auto'
+        $records[1].DryRun | Should -BeFalse
+    }
+
+    It "honors the selected batch method in dry-run and live modes" {
+        $previewTarget = Join-Path $TestDrive 'batch-preview.txt'
+        $liveTarget = Join-Path $TestDrive 'batch-live.txt'
+        Set-Content -LiteralPath $previewTarget -Value 'preview'
+        Set-Content -LiteralPath $liveTarget -Value 'delete in test drive'
+
+        $preview = Invoke-PathForgeDeletionMethod -Path $previewTarget -Method DotNet -WhatIf
+        $live = Invoke-PathForgeDeletionMethod -Path $liveTarget -Method Standard -Confirm:$false
+
+        $preview.Simulated | Should -BeTrue
+        Test-Path -LiteralPath $previewTarget | Should -BeTrue
+        $live.Success | Should -BeTrue
+        Test-Path -LiteralPath $liveTarget | Should -BeFalse
     }
 }
 
@@ -429,6 +481,57 @@ Describe "Deletion dry-run GUI wiring" {
         Test-Path -LiteralPath $target | Should -BeTrue
         Should -Invoke Register-BootTimeDelete -Times 0
         Should -Invoke Set-ItemProperty -Times 0
+    }
+}
+
+Describe "Deletion batch GUI" {
+    It "exposes the batch loader from the File Operations page" {
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+
+        $fileOpsAst.Extent.Text | Should -Match 'Title "Batch Delete"'
+        $fileOpsAst.Extent.Text | Should -Match 'BtnText "Load Batch\.\.\."'
+        $fileOpsAst.Extent.Text | Should -Match 'Show-DeletionBatchDialog'
+    }
+
+    It "processes a forced dry-run batch without confirmation or mutation" {
+        $target = Join-Path $TestDrive 'batch-gui-preview.txt'
+        $batchPath = Join-Path $TestDrive 'batch-gui-preview.csv'
+        Set-Content -LiteralPath $target -Value 'keep batch target'
+        @('Path,Method,DryRun', "`"$target`",Standard,false") | Set-Content -LiteralPath $batchPath
+        $originalRecycleCheck = $Script:RecycleBinCheck
+        try {
+            $Script:RecycleBinCheck = [PSCustomObject]@{Checked = $false}
+            Mock Write-Console
+            Mock Write-Log
+            Mock Set-Status
+            Mock Set-Progress
+
+            $summary = Invoke-DeletionBatch -BatchPath $batchPath -ForceDryRun -ConfirmAction { throw 'dry-run batch must not prompt' }
+
+            $summary.Simulated | Should -Be 1
+            $summary.Failed | Should -Be 0
+            Test-Path -LiteralPath $target | Should -BeTrue
+        }
+        finally {
+            $Script:RecycleBinCheck = $originalRecycleCheck
+            $Script:OperationRunning = $false
+        }
+    }
+
+    It "cancels a mutating batch before processing any row" {
+        $target = Join-Path $TestDrive 'batch-gui-cancel.txt'
+        $batchPath = Join-Path $TestDrive 'batch-gui-cancel.txtlist'
+        Set-Content -LiteralPath $target -Value 'keep cancelled target'
+        "$target|Standard|false" | Set-Content -LiteralPath $batchPath
+        Mock Write-Console
+
+        $summary = Invoke-DeletionBatch -BatchPath $batchPath -ConfirmAction { 7 }
+
+        $summary.Cancelled | Should -BeTrue
+        Test-Path -LiteralPath $target | Should -BeTrue
     }
 }
 

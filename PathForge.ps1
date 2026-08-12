@@ -1055,6 +1055,122 @@ function Invoke-ForceDelete {
     return $false
 }
 
+function Invoke-DeletionBatch {
+    param(
+        [string]$BatchPath,
+        [switch]$ForceDryRun,
+        [scriptblock]$ConfirmAction
+    )
+
+    try {
+        $records = @(Import-PathForgeDeletionBatch -Path $BatchPath)
+    }
+    catch {
+        Write-Console "Batch import failed: $_" -Type "Error"
+        return $null
+    }
+
+    if ($records.Count -eq 0) {
+        Write-Console "Batch file contains no actionable rows" -Type "Warning"
+        return $null
+    }
+
+    Write-Console "=== DELETION BATCH ===" -Type "Info"
+    Write-Console "Source: $BatchPath" -Type "Normal"
+    Write-Console "Rows: $($records.Count)" -Type "Normal"
+
+    foreach ($record in $records) {
+        if ($record.Valid) {
+            $rowMode = if ($ForceDryRun -or $record.DryRun) { 'DRY-RUN' } else { 'DELETE' }
+            Write-Console "  Line $($record.LineNumber): [$rowMode/$($record.Method)] $($record.Path)" -Type "Normal"
+        }
+        else {
+            Write-Console "  Line $($record.LineNumber): INVALID - $($record.Error)" -Type "Error"
+        }
+    }
+
+    $validRecords = @($records | Where-Object Valid)
+    $mutatingRecords = @($validRecords | Where-Object { -not $ForceDryRun -and -not $_.DryRun })
+    if ($validRecords.Count -eq 0) {
+        Write-Console "No valid rows to process" -Type "Error"
+        return [PSCustomObject]@{Total = $records.Count; Succeeded = 0; Failed = $records.Count; Simulated = 0; Cancelled = $false }
+    }
+
+    if ($mutatingRecords.Count -gt 0) {
+        $message = "Process $($validRecords.Count) valid batch row(s)?`n`n$($mutatingRecords.Count) row(s) can delete files or modify the reboot queue. Review the console preview before continuing."
+        $confirmation = if ($ConfirmAction) {
+            & $ConfirmAction $message
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show(
+                $message,
+                "Confirm Deletion Batch",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning)
+        }
+        if ($confirmation -ne 6) {
+            Write-Console "Batch cancelled before any row was processed" -Type "Warning"
+            return [PSCustomObject]@{Total = $records.Count; Succeeded = 0; Failed = 0; Simulated = 0; Cancelled = $true }
+        }
+    }
+
+    if (-not (Enter-Operation "Deletion batch")) { return $null }
+    $succeeded = 0
+    $failed = @($records | Where-Object { -not $_.Valid }).Count
+    $simulated = 0
+
+    try {
+        $rowIndex = 0
+        foreach ($record in $validRecords) {
+            $rowIndex++
+            Set-Progress -Value $rowIndex -Maximum $validRecords.Count
+            Set-Status "Batch row $rowIndex/$($validRecords.Count): $($record.Method)"
+            $dryRun = [bool]($ForceDryRun -or $record.DryRun)
+
+            if ($dryRun) {
+                $result = Invoke-PathForgeDeletionMethod -Path $record.Path -Method $record.Method `
+                    -IncludeRecycleBin:($Script:RecycleBinCheck -and $Script:RecycleBinCheck.Checked) -WhatIf
+            }
+            else {
+                $result = Invoke-PathForgeDeletionMethod -Path $record.Path -Method $record.Method `
+                    -IncludeRecycleBin:($Script:RecycleBinCheck -and $Script:RecycleBinCheck.Checked) -Confirm:$false
+            }
+
+            if ($result.Simulated) {
+                $simulated++
+                Write-Console "  [DRY-RUN] Line $($record.LineNumber): would use $($record.Method) on $($record.Path)" -Type "Info"
+            }
+            elseif ($result.Success) {
+                $succeeded++
+                Write-Console "  [SUCCESS] Line $($record.LineNumber): $($result.EffectiveMethod)" -Type "Success"
+            }
+            else {
+                $failed++
+                Write-Console "  [FAILED] Line $($record.LineNumber): $($result.Error)" -Type "Error"
+            }
+        }
+    }
+    finally {
+        Exit-Operation
+    }
+
+    Write-Console "Batch complete: $succeeded succeeded, $simulated simulated, $failed failed/invalid" -Type $(if ($failed -gt 0) { 'Warning' } else { 'Success' })
+    Write-Log "Deletion batch complete: source=$BatchPath success=$succeeded simulated=$simulated failed=$failed" -Level "INFO"
+    return [PSCustomObject]@{Total = $records.Count; Succeeded = $succeeded; Failed = $failed; Simulated = $simulated; Cancelled = $false }
+}
+
+function Show-DeletionBatchDialog {
+    $dialog = New-Object System.Windows.Forms.OpenFileDialog
+    $dialog.Title = "Select PathForge deletion batch"
+    $dialog.Filter = "Deletion batches (*.csv;*.txt)|*.csv;*.txt|CSV files (*.csv)|*.csv|Text files (*.txt)|*.txt|All files (*.*)|*.*"
+    $dialog.CheckFileExists = $true
+    if ($dialog.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        return
+    }
+
+    Invoke-DeletionBatch -BatchPath $dialog.FileName -ForceDryRun:($Script:DryRunCheck -and $Script:DryRunCheck.Checked) | Out-Null
+}
+
 # ============================================================================
 # OWNERSHIP & PERMISSIONS
 # ============================================================================
@@ -2794,6 +2910,10 @@ function Build-FileOpsPage {
         Get-PendingDeletions 
     }
     $null = $page.Controls.Add($card3)
+    $y += 130
+
+    $card4 = New-ToolCard -Title "Batch Delete" -Desc "Load CSV or text rows and select Auto or a specific API per path" -BtnText "Load Batch..." -X 30 -Y $y -OnClick { Show-DeletionBatchDialog }
+    $null = $page.Controls.Add($card4)
     $y += 130
     
     # ========== BOOT DELETE INFO PANEL ==========

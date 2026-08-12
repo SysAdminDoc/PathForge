@@ -37,7 +37,7 @@ Describe "PathForge.Core module boundary" {
                 'Get-PathForgeLinkInfo', 'Find-PathForgeReparsePoint', 'Remove-PathForgeLinkSafe',
                 'Get-PathForgeQuarantineItem', 'Move-PathForgeToQuarantine',
                 'Restore-PathForgeQuarantineItem', 'Remove-PathForgeQuarantineItem',
-                'Invoke-PathForgeQuarantineMaintenance')) {
+                'Invoke-PathForgeQuarantineMaintenance', 'Get-PathForgeMftReport')) {
             (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
         }
     }
@@ -151,6 +151,90 @@ Describe "PathForge.Core module boundary" {
         $report.SmartStatuses.Count | Should -Be 1
         $report.ReliabilityCounters.Count | Should -Be 1
         $report.Errors.Count | Should -Be 0
+    }
+
+    It "builds an MFT size and fragmentation report from native volume extents" {
+        Mock Get-VolumeFileSystem -ModuleName PathForge.Core { 'NTFS' }
+        Mock Get-PathForgeNtfsVolumeDataNative -ModuleName PathForge.Core {
+            [PSCustomObject]@{
+                VolumeSerialNumber = 12345
+                NumberSectors = 8000000
+                TotalClusters = 1000000
+                FreeClusters = 400000
+                TotalReserved = 0
+                BytesPerSector = 512
+                BytesPerCluster = 4096
+                BytesPerFileRecordSegment = 1024
+                ClustersPerFileRecordSegment = 0
+                MftValidDataLength = 12288000
+                MftStartLcn = 1000
+                Mft2StartLcn = 900000
+                MftZoneStart = 100000
+                MftZoneEnd = 200000
+            }
+        }
+        Mock Get-PathForgeMftExtentNative -ModuleName PathForge.Core {
+            @(
+                [PSCustomObject]@{StartingVcn = 0; NextVcn = 1000; Lcn = 1000 },
+                [PSCustomObject]@{StartingVcn = 1000; NextVcn = 3000; Lcn = 5000 }
+            )
+        }
+
+        $report = Get-PathForgeMftReport -Drive 'c:'
+
+        $report.Success | Should -BeTrue
+        $report.Supported | Should -BeTrue
+        $report.Drive | Should -Be 'C:'
+        $report.MftSizeBytes | Should -Be 12288000
+        $report.MftAllocatedBytes | Should -Be 12288000
+        $report.EstimatedRecordCount | Should -Be 12000
+        $report.ExtentCount | Should -Be 2
+        $report.FragmentCount | Should -Be 1
+        $report.IsFragmented | Should -BeTrue
+        $report.FragmentationLabel | Should -Be 'Fragmented (2 extents)'
+        $report.Extents[1].PhysicalEndLcn | Should -Be 6999
+        $report.MftZoneBytes | Should -Be 409600000
+    }
+
+    It "keeps volume metadata when the MFT extent map is unavailable" {
+        Mock Get-VolumeFileSystem -ModuleName PathForge.Core { 'NTFS' }
+        Mock Get-PathForgeNtfsVolumeDataNative -ModuleName PathForge.Core {
+            [PSCustomObject]@{
+                VolumeSerialNumber = 12345
+                TotalClusters = 1000000
+                FreeClusters = 400000
+                BytesPerSector = 512
+                BytesPerCluster = 4096
+                BytesPerFileRecordSegment = 1024
+                MftValidDataLength = 12288000
+                MftStartLcn = 1000
+                Mft2StartLcn = 900000
+                MftZoneStart = 100000
+                MftZoneEnd = 200000
+            }
+        }
+        Mock Get-PathForgeMftExtentNative -ModuleName PathForge.Core { throw 'extent query unavailable' }
+
+        $report = Get-PathForgeMftReport -Drive 'C:'
+
+        $report.Success | Should -BeTrue
+        $report.ExtentQuerySuccess | Should -BeFalse
+        $report.MftSizeBytes | Should -Be 12288000
+        $report.FragmentationLabel | Should -Be 'Extent map unavailable'
+        $report.ExtentError | Should -Be 'extent query unavailable'
+        $report.Extents.Count | Should -Be 0
+    }
+
+    It "rejects MFT reporting on non-NTFS volumes before native access" {
+        Mock Get-VolumeFileSystem -ModuleName PathForge.Core { 'ReFS' }
+        Mock Get-PathForgeNtfsVolumeDataNative -ModuleName PathForge.Core { throw 'must not query native NTFS data' }
+
+        $report = Get-PathForgeMftReport -Drive 'D:'
+
+        $report.Success | Should -BeFalse
+        $report.Supported | Should -BeFalse
+        $report.Error | Should -Match 'only to NTFS'
+        Should -Invoke Get-PathForgeNtfsVolumeDataNative -ModuleName PathForge.Core -Times 0
     }
 
     It "packages the GUI and core module together in the Scoop manifest" {
@@ -968,6 +1052,38 @@ Describe "Quarantine zone GUI" {
         $result.Simulated | Should -BeTrue
         Test-Path -LiteralPath $target | Should -BeTrue
         Should -Invoke Move-PathForgeToQuarantine -Times 1 -ParameterFilter { $WhatIf }
+    }
+}
+
+Describe "MFT size and fragmentation report GUI" {
+    It "exposes the MFT report from Drive Diagnostics" {
+        $diagnosticsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-DiagnosticsPage'
+        }, $true) | Select-Object -First 1
+        $reportAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-MftReport'
+        }, $true) | Select-Object -First 1
+
+        $diagnosticsAst.Extent.Text | Should -Match 'Title "MFT Layout"'
+        $diagnosticsAst.Extent.Text | Should -Match 'BtnText "Open MFT Report"'
+        $diagnosticsAst.Extent.Text | Should -Match 'Show-MftReport'
+        $reportAst.Extent.Text | Should -Match 'MftExtentGraph'
+        $reportAst.Extent.Text | Should -Match 'MftExtentGrid'
+        $reportAst.Extent.Text | Should -Match 'Add_Paint'
+        $reportAst.Extent.Text | Should -Match 'Get-PathForgeMftReport'
+        $reportAst.Extent.Text | Should -Match 'Physical LCN by logical MFT order'
+        $reportAst.Extent.Text | Should -Match 'Export CSV'
+    }
+
+    It "uses native NTFS volume data and retrieval-pointer controls" {
+        $coreSource = Get-Content -Raw -LiteralPath $coreModulePath
+
+        $coreSource | Should -Match 'FSCTL_GET_NTFS_VOLUME_DATA'
+        $coreSource | Should -Match 'FSCTL_GET_RETRIEVAL_POINTERS'
+        $coreSource | Should -Match 'NativeNtfsVolumeData'
+        $coreSource | Should -Match 'PathForgeFileExtent'
     }
 }
 

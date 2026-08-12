@@ -39,6 +39,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 
 ### 📊 Diagnostics
 - **Drive Health Report** — Physical disk info, volumes, and partition layout
+- **MFT Layout Report** — Read native NTFS size, record, extent, and fragmentation data with a physical-placement graph and CSV export
 - **SMART Monitoring** — Failure prediction with critical attribute warnings
 - **Reliability Counters** — Read/write errors, temperature, wear leveling
 - **Event Log Analysis** — Surface disk-related warnings (Event IDs 55, 50, 98, 129, 153, 157)
@@ -141,6 +142,12 @@ Use **Link Inspector** on a file or directory to distinguish ordinary objects, h
 
 Use **Reparse Explorer** on a directory to list reparse type, native tag, path, and target. Its iterative scan never enqueues a discovered reparse-point directory, so target trees are not traversed. Results can be inspected individually or exported to CSV.
 
+### MFT Layout
+
+Open **MFT Layout** from Diagnostics to inspect the selected NTFS volume without modifying it. The report shows valid and allocated MFT size, estimated file-record count, cluster/record sizes, fragmentation boundaries, and every native extent. The graph plots logical MFT order against physical cluster placement and marks the reserved MFT zone; the extent table can be exported to CSV.
+
+The report is NTFS-only and uses the application's required administrator access. If Windows provides volume metadata but refuses the extent query, PathForge keeps the size report visible and explains why the placement map is unavailable.
+
 ### Repair Sequence
 For corrupted systems, run repairs in this order:
 
@@ -212,6 +219,8 @@ PathForge includes detailed explanations accessible via **ℹ️ Show Details** 
 ### APIs Used
 - **DwmSetWindowAttribute** — Dark mode title bar (Windows 10 1809+)
 - **MoveFileEx** — Boot-time deletion scheduling (MOVEFILE_DELAY_UNTIL_REBOOT)
+- **FSCTL_GET_NTFS_VOLUME_DATA** — Read NTFS volume geometry, MFT size, record size, and reserved zone
+- **FSCTL_GET_RETRIEVAL_POINTERS** — Enumerate the physical extents backing the MFT without changing the volume
 - **FSCTL_GET_REPARSE_POINT** — Native reparse tag and target inspection without following the link
 - **FindFirstFileNameW / FindNextFileNameW** — Enumerate every hard-link name
 - **DeleteFileW / RemoveDirectoryW** — Remove only a recognized link or hard-link name without recursive traversal

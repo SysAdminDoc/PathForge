@@ -2259,7 +2259,7 @@ function Show-ReparsePointExplorer {
     $inspectButton.Add_Click({ & $inspectSelected }.GetNewClosure())
     $refreshButton.Add_Click({ & $loadResults }.GetNewClosure())
     $exportButton.Add_Click({
-        $report = $dialog.Tag
+        $report = $paintSender.Tag
         if (-not $report -or $report.Items.Count -eq 0) { return }
         try {
             if (-not (Test-Path -LiteralPath $reportDirectory)) {
@@ -3501,6 +3501,392 @@ function Get-FilesystemEvents {
     }
 }
 
+function Show-MftReport {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "NTFS Master File Table Report"
+    $dialog.Size = New-Object System.Drawing.Size(1120, 760)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(1000, 680)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.Add_HandleCreated({ try { [DarkMode]::EnableDarkTitleBar($this.Handle) } catch { Write-Verbose "MFT report title-bar theming failed: $_" } })
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "NTFS Master File Table"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $Script:Theme.TextPrimary
+    $title.Location = New-Object System.Drawing.Point(20, 14)
+    $title.AutoSize = $true
+    $null = $dialog.Controls.Add($title)
+
+    $description = New-Object System.Windows.Forms.Label
+    $description.Text = "Read-only native extent map: logical MFT order plotted against physical cluster placement."
+    $description.ForeColor = $Script:Theme.TextMuted
+    $description.Location = New-Object System.Drawing.Point(22, 46)
+    $description.Size = New-Object System.Drawing.Size(650, 22)
+    $null = $dialog.Controls.Add($description)
+
+    $driveLabel = New-Object System.Windows.Forms.Label
+    $driveLabel.Text = "NTFS DRIVE"
+    $driveLabel.ForeColor = $Script:Theme.TextMuted
+    $driveLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 8)
+    $driveLabel.Location = New-Object System.Drawing.Point(700, 16)
+    $driveLabel.AutoSize = $true
+    $null = $dialog.Controls.Add($driveLabel)
+
+    $driveCombo = New-Object System.Windows.Forms.ComboBox
+    $driveCombo.Name = "MftDriveCombo"
+    $driveCombo.AccessibleName = "Select NTFS drive for MFT report"
+    $driveCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $driveCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $driveCombo.BackColor = $Script:Theme.BgInput
+    $driveCombo.ForeColor = $Script:Theme.TextPrimary
+    $driveCombo.Location = New-Object System.Drawing.Point(700, 37)
+    $driveCombo.Size = New-Object System.Drawing.Size(190, 25)
+    try {
+        foreach ($volume in @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter -and $_.FileSystem -eq 'NTFS' })) {
+            $label = if ([string]::IsNullOrWhiteSpace([string]$volume.FileSystemLabel)) { 'Local Disk' } else { [string]$volume.FileSystemLabel }
+            $null = $driveCombo.Items.Add("$($volume.DriveLetter): $label")
+        }
+    }
+    catch {
+        Write-Verbose "Could not enumerate NTFS volumes for the MFT report: $_"
+    }
+    if ($driveCombo.Items.Count -eq 0 -and $env:SystemDrive -match '^[A-Za-z]:$') {
+        $null = $driveCombo.Items.Add("$($env:SystemDrive) System Drive")
+    }
+    if ($driveCombo.Items.Count -gt 0) { $driveCombo.SelectedIndex = 0 }
+    $null = $dialog.Controls.Add($driveCombo)
+
+    $refreshButton = New-Object System.Windows.Forms.Button
+    $refreshButton.Text = "Refresh"
+    $refreshButton.AccessibleName = "Refresh MFT report"
+    $refreshButton.Location = New-Object System.Drawing.Point(900, 35)
+    $refreshButton.Size = New-Object System.Drawing.Size(85, 29)
+    $refreshButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $refreshButton.BackColor = $Script:Theme.AccentDim
+    $refreshButton.ForeColor = $Script:Theme.TextPrimary
+    $refreshButton.FlatAppearance.BorderSize = 0
+    $refreshButton.Enabled = $driveCombo.Items.Count -gt 0
+    $null = $dialog.Controls.Add($refreshButton)
+
+    $exportButton = New-Object System.Windows.Forms.Button
+    $exportButton.Text = "Export CSV"
+    $exportButton.AccessibleName = "Export MFT extent report to CSV"
+    $exportButton.Location = New-Object System.Drawing.Point(993, 35)
+    $exportButton.Size = New-Object System.Drawing.Size(95, 29)
+    $exportButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $exportButton.BackColor = $Script:Theme.BgTertiary
+    $exportButton.ForeColor = $Script:Theme.TextSecondary
+    $exportButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $exportButton.Enabled = $false
+    $null = $dialog.Controls.Add($exportButton)
+
+    $summaryPanel = New-Object System.Windows.Forms.Panel
+    $summaryPanel.Name = "MftSummaryPanel"
+    $summaryPanel.Location = New-Object System.Drawing.Point(20, 78)
+    $summaryPanel.Size = New-Object System.Drawing.Size(1068, 72)
+    $summaryPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $summaryPanel.BackColor = $Script:Theme.BgCard
+    $null = $dialog.Controls.Add($summaryPanel)
+
+    $summaryValues = @{}
+    $summaryDefinitions = @(
+        @{Key = 'Size'; Title = 'MFT VALID DATA'; X = 18 },
+        @{Key = 'Allocated'; Title = 'ALLOCATED'; X = 225 },
+        @{Key = 'Extents'; Title = 'FRAGMENTATION'; X = 432 },
+        @{Key = 'Records'; Title = 'EST. RECORDS'; X = 639 },
+        @{Key = 'Cluster'; Title = 'CLUSTER / RECORD'; X = 846 }
+    )
+    foreach ($definition in $summaryDefinitions) {
+        $heading = New-Object System.Windows.Forms.Label
+        $heading.Text = $definition.Title
+        $heading.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 7.5)
+        $heading.ForeColor = $Script:Theme.TextMuted
+        $heading.Location = New-Object System.Drawing.Point($definition.X, 10)
+        $heading.Size = New-Object System.Drawing.Size(195, 18)
+        $null = $summaryPanel.Controls.Add($heading)
+
+        $value = New-Object System.Windows.Forms.Label
+        $value.Name = "MftSummary$($definition.Key)"
+        $value.Text = "-"
+        $value.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 11)
+        $value.ForeColor = $Script:Theme.Info
+        $value.Location = New-Object System.Drawing.Point($definition.X, 31)
+        $value.Size = New-Object System.Drawing.Size(195, 30)
+        $value.AutoEllipsis = $true
+        $null = $summaryPanel.Controls.Add($value)
+        $summaryValues[$definition.Key] = $value
+    }
+
+    $graph = New-Object System.Windows.Forms.Panel
+    $graph.Name = "MftExtentGraph"
+    $graph.AccessibleName = "MFT physical extent placement graph"
+    $graph.Location = New-Object System.Drawing.Point(20, 162)
+    $graph.Size = New-Object System.Drawing.Size(1068, 238)
+    $graph.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $graph.BackColor = $Script:Theme.BgInput
+    $null = $dialog.Controls.Add($graph)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "MftExtentGrid"
+    $grid.AccessibleName = "MFT extent table"
+    $grid.Location = New-Object System.Drawing.Point(20, 412)
+    $grid.Size = New-Object System.Drawing.Size(1068, 245)
+    $grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $grid.BackgroundColor = $Script:Theme.BgInput
+    $grid.ForeColor = $Script:Theme.TextPrimary
+    $grid.GridColor = $Script:Theme.Border
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $grid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $grid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $grid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $grid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.RowHeadersVisible = $false
+    foreach ($columnDefinition in @(
+            @{Name = 'Index'; Header = '#'; Width = 45 },
+            @{Name = 'LogicalStart'; Header = 'Start VCN'; Width = 150 },
+            @{Name = 'LogicalEnd'; Header = 'End VCN'; Width = 150 },
+            @{Name = 'PhysicalStart'; Header = 'Start LCN'; Width = 170 },
+            @{Name = 'PhysicalEnd'; Header = 'End LCN'; Width = 170 },
+            @{Name = 'Clusters'; Header = 'Clusters'; Width = 140 },
+            @{Name = 'Bytes'; Header = 'Bytes'; Width = 170 })) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.Name = $columnDefinition.Name
+        $column.HeaderText = $columnDefinition.Header
+        $column.Width = $columnDefinition.Width
+        $null = $grid.Columns.Add($column)
+    }
+    $null = $dialog.Controls.Add($grid)
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Name = "MftReportStatus"
+    $statusLabel.ForeColor = $Script:Theme.TextMuted
+    $statusLabel.Location = New-Object System.Drawing.Point(22, 672)
+    $statusLabel.Size = New-Object System.Drawing.Size(780, 30)
+    $statusLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $statusLabel.Text = if ($driveCombo.Items.Count -gt 0) { 'Ready to query native NTFS metadata.' } else { 'No local NTFS volumes were found.' }
+    $null = $dialog.Controls.Add($statusLabel)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $closeButton.Location = New-Object System.Drawing.Point(998, 669)
+    $closeButton.Size = New-Object System.Drawing.Size(90, 32)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.BackColor = $Script:Theme.BgTertiary
+    $closeButton.ForeColor = $Script:Theme.TextSecondary
+    $closeButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $null = $dialog.Controls.Add($closeButton)
+    $dialog.CancelButton = $closeButton
+
+    $formatBytes = {
+        param([int64]$Value)
+        if ($Value -ge 1TB) { return ('{0:N2} TB' -f ($Value / 1TB)) }
+        if ($Value -ge 1GB) { return ('{0:N2} GB' -f ($Value / 1GB)) }
+        if ($Value -ge 1MB) { return ('{0:N2} MB' -f ($Value / 1MB)) }
+        if ($Value -ge 1KB) { return ('{0:N2} KB' -f ($Value / 1KB)) }
+        return "$Value bytes"
+    }
+
+    $graphState = [PSCustomObject]@{
+        Report     = $null
+        Background = $Script:Theme.BgInput
+        Border     = $Script:Theme.Border
+        Line       = $Script:Theme.Info
+        Point      = $Script:Theme.Warning
+        Text       = $Script:Theme.TextMuted
+        Zone       = $Script:Theme.AccentDim
+    }
+    $graph.Tag = $graphState
+    $graph.Add_Paint({
+        param($paintSender, $paintEvent)
+        $graphics = $null
+        $titleFont = $null
+        $labelFont = $null
+        $axisPen = $null
+        $linePen = $null
+        $pointBrush = $null
+        $textBrush = $null
+        $zoneBrush = $null
+        try {
+            $state = $paintSender.Tag
+            $report = $state.Report
+            $bounds = $paintSender.ClientRectangle
+            $graphics = $paintEvent.Graphics
+            $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $titleFont = New-Object System.Drawing.Font("Segoe UI Semibold", 8.5)
+            $labelFont = New-Object System.Drawing.Font("Segoe UI", 7.5)
+            $axisPen = New-Object System.Drawing.Pen($state.Border, 1)
+            $linePen = New-Object System.Drawing.Pen($state.Line, 2)
+            $pointBrush = New-Object System.Drawing.SolidBrush($state.Point)
+            $textBrush = New-Object System.Drawing.SolidBrush($state.Text)
+            $zoneBrush = New-Object System.Drawing.SolidBrush($state.Zone)
+            $graphics.DrawString('Physical LCN by logical MFT order', $titleFont, $textBrush, 14, 8)
+            $plotLeft = 48
+            $plotTop = 32
+            $plotWidth = [Math]::Max(100, $bounds.Width - 68)
+            $plotHeight = 112
+            $graphics.DrawRectangle($axisPen, $plotLeft, $plotTop, $plotWidth, $plotHeight)
+
+            if ($report -and $report.Success -and $report.ExtentQuerySuccess -and $report.Extents.Count -gt 0) {
+                [double]$logicalTotal = [Math]::Max(1, ($report.Extents | Measure-Object LogicalEndVcn -Maximum).Maximum + 1)
+                [double]$physicalTotal = [Math]::Max(1, $report.TotalClusters)
+                $previousPoint = $null
+                foreach ($extent in @($report.Extents | Where-Object { -not $_.IsSparse })) {
+                    $pointX = $plotLeft + [int][Math]::Round(($extent.LogicalStartVcn / $logicalTotal) * $plotWidth)
+                    $pointY = $plotTop + $plotHeight - [int][Math]::Round(($extent.PhysicalStartLcn / $physicalTotal) * $plotHeight)
+                    $pointY = [Math]::Max($plotTop, [Math]::Min($plotTop + $plotHeight, $pointY))
+                    $point = New-Object System.Drawing.Point($pointX, $pointY)
+                    if ($previousPoint) { $graphics.DrawLine($linePen, $previousPoint, $point) }
+                    $graphics.FillEllipse($pointBrush, $pointX - 3, $pointY - 3, 7, 7)
+                    $previousPoint = $point
+                }
+
+                $barTop = 184
+                $barHeight = 17
+                $graphics.DrawString('Physical volume map', $labelFont, $textBrush, 14, 160)
+                $graphics.DrawRectangle($axisPen, $plotLeft, $barTop, $plotWidth, $barHeight)
+                $zoneX = $plotLeft + [int][Math]::Round(($report.MftZoneStartLcn / $physicalTotal) * $plotWidth)
+                $zoneWidth = [Math]::Max(1, [int][Math]::Round((($report.MftZoneEndLcn - $report.MftZoneStartLcn) / $physicalTotal) * $plotWidth))
+                $graphics.FillRectangle($zoneBrush, $zoneX, $barTop + 1, $zoneWidth, $barHeight - 1)
+                foreach ($extent in @($report.Extents | Where-Object { -not $_.IsSparse })) {
+                    $extentX = $plotLeft + [int][Math]::Round(($extent.PhysicalStartLcn / $physicalTotal) * $plotWidth)
+                    $extentWidth = [Math]::Max(2, [int][Math]::Round(($extent.ClusterCount / $physicalTotal) * $plotWidth))
+                    $graphics.FillRectangle($pointBrush, $extentX, $barTop + 2, $extentWidth, $barHeight - 3)
+                }
+                $graphics.DrawString('Blue: reserved MFT zone   Gold: allocated MFT extents', $labelFont, $textBrush, $plotLeft, 207)
+            }
+            else {
+                $graphics.DrawString('Extent placement is unavailable for the selected volume.', $labelFont, $textBrush, $plotLeft + 12, $plotTop + 45)
+            }
+        }
+        catch {
+            $paintSender.AccessibleDescription = $_.Exception.Message
+            try {
+                $fallbackGraphics = $paintEvent.Graphics
+                $fallbackGraphics.Clear([System.Drawing.Color]::FromArgb(22, 22, 28))
+                $fallbackFont = New-Object System.Drawing.Font("Segoe UI", 8)
+                $fallbackBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 95, 95))
+                try { $fallbackGraphics.DrawString("Graph rendering unavailable: $($_.Exception.Message)", $fallbackFont, $fallbackBrush, 16, 20) }
+                finally { $fallbackFont.Dispose(); $fallbackBrush.Dispose() }
+            }
+            catch { Write-Verbose "MFT graph fallback rendering failed: $_" }
+        }
+        finally {
+            foreach ($drawingResource in @($titleFont, $labelFont, $axisPen, $linePen, $pointBrush, $textBrush, $zoneBrush)) {
+                if ($drawingResource) { $drawingResource.Dispose() }
+            }
+        }
+    }.GetNewClosure())
+
+    $loadState = [PSCustomObject]@{Running = $false}
+    $loadReport = {
+        if ($loadState.Running) { return }
+        if ($driveCombo.SelectedIndex -lt 0) { return }
+        $loadState.Running = $true
+        $drive = $driveCombo.Text.Substring(0, 2)
+        $statusLabel.Text = "Reading native NTFS metadata for $drive..."
+        $statusLabel.ForeColor = $Script:Theme.Info
+        try {
+            if ($grid.Rows.Count -gt 0) { $grid.Rows.Clear() }
+            $report = Get-PathForgeMftReport -Drive $drive
+            $dialog.Tag = $report
+            $graph.Tag.Report = $report
+            if (-not $report.Success) {
+                foreach ($valueLabel in $summaryValues.Values) { $valueLabel.Text = '-' }
+                $statusLabel.Text = $report.Error
+                $statusLabel.ForeColor = $Script:Theme.Error
+                $exportButton.Enabled = $false
+                $graph.Invalidate()
+                Write-Console "MFT report failed for ${drive}: $($report.Error)" -Type "Error"
+                return
+            }
+
+            $summaryValues.Size.Text = & $formatBytes $report.MftSizeBytes
+            $summaryValues.Allocated.Text = & $formatBytes $report.MftAllocatedBytes
+            $summaryValues.Extents.Text = $report.FragmentationLabel
+            $summaryValues.Extents.ForeColor = if ($report.IsFragmented) { $Script:Theme.Warning } else { $Script:Theme.Success }
+            $summaryValues.Records.Text = ('{0:N0}' -f $report.EstimatedRecordCount)
+            $summaryValues.Cluster.Text = "$( & $formatBytes $report.BytesPerCluster) / $( & $formatBytes $report.BytesPerFileRecordSegment)"
+
+            foreach ($extent in $report.Extents) {
+                $physicalStart = if ($extent.IsSparse) { 'Sparse' } else { ('{0:N0}' -f $extent.PhysicalStartLcn) }
+                $physicalEnd = if ($extent.IsSparse) { 'Sparse' } else { ('{0:N0}' -f $extent.PhysicalEndLcn) }
+                $null = $grid.Rows.Add(
+                    $extent.Index,
+                    ('{0:N0}' -f $extent.LogicalStartVcn),
+                    ('{0:N0}' -f $extent.LogicalEndVcn),
+                    $physicalStart,
+                    $physicalEnd,
+                    ('{0:N0}' -f $extent.ClusterCount),
+                    (& $formatBytes $extent.LengthBytes))
+            }
+
+            if ($report.ExtentQuerySuccess) {
+                $statusLabel.Text = "Read-only report complete: $($report.ExtentCount) allocated extent(s), $($report.FragmentCount) fragmentation boundary/boundaries."
+                $statusLabel.ForeColor = if ($report.IsFragmented) { $Script:Theme.Warning } else { $Script:Theme.Success }
+                $exportButton.Enabled = $report.Extents.Count -gt 0
+            }
+            else {
+                $statusLabel.Text = "MFT size loaded, but extent map failed: $($report.ExtentError)"
+                $statusLabel.ForeColor = $Script:Theme.Warning
+                $exportButton.Enabled = $false
+            }
+            Write-Console "MFT $drive : $( & $formatBytes $report.MftSizeBytes), $($report.FragmentationLabel)" -Type "Info"
+            Write-Log "MFT report generated: drive=$drive size=$($report.MftSizeBytes) extents=$($report.ExtentCount)" -Level "INFO"
+            $graph.Invalidate()
+        }
+        catch {
+            $statusLabel.Text = $_.Exception.Message
+            $statusLabel.ForeColor = $Script:Theme.Error
+            $exportButton.Enabled = $false
+            Write-Console "MFT report failed for ${drive}: $($_.Exception.Message)" -Type "Error"
+        }
+        finally {
+            $loadState.Running = $false
+        }
+    }.GetNewClosure()
+
+    $refreshButton.Add_Click({ & $loadReport }.GetNewClosure())
+    $driveCombo.Add_SelectedIndexChanged({ if ($dialog.Visible) { & $loadReport } }.GetNewClosure())
+    $exportButton.Add_Click({
+        $report = $dialog.Tag
+        if (-not $report -or -not $report.Success -or $report.Extents.Count -eq 0) { return }
+        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Title = "Export MFT extent report"
+        $saveDialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+        $saveDialog.FileName = "MFT_$($report.Drive.TrimEnd(':'))_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        $saveDialog.InitialDirectory = $Script:Config.LogPath
+        if ($saveDialog.ShowDialog($dialog) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        try {
+            $report.Extents | Select-Object Index, LogicalStartVcn, LogicalEndVcn, PhysicalStartLcn, PhysicalEndLcn, ClusterCount, LengthBytes, IsSparse |
+                Export-Csv -LiteralPath $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            Write-Console "MFT extent report exported: $($saveDialog.FileName)" -Type "Success"
+            Write-Log "MFT extent report exported: $($saveDialog.FileName)" -Level "SUCCESS"
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, "Export Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $dialog.Add_Shown({ & $loadReport }.GetNewClosure())
+
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) { [void]$dialog.ShowDialog($owner) } else { [void]$dialog.ShowDialog() }
+    $dialog.Dispose()
+}
+
 # ============================================================================
 # UI COMPONENTS
 # ============================================================================
@@ -4458,6 +4844,10 @@ function Build-DiagnosticsPage {
     
     $card6 = New-ToolCard -Title "Reliability Counters" -Desc "Read/Write errors, temperature, wear level" -BtnText "View Counters" -X 610 -Y $y -OnClick { Get-ReliabilityCounter }
     $null = $page.Controls.Add($card6)
+    $y += 130
+
+    $mftCard = New-ToolCard -Title "MFT Layout" -Desc "Report Master File Table size, records, extents, and physical fragmentation graph" -BtnText "Open MFT Report" -X 30 -Y $y -OnClick { Show-MftReport }
+    $null = $page.Controls.Add($mftCard)
     $y += 130
     
     # SMART Info Panel

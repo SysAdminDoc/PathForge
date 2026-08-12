@@ -17,6 +17,7 @@ All notable changes to PathForge will be documented in this file.
 - Scheduled deletion queue editor with pair-preserving selective cancellation, stale-snapshot protection, and modern queue-prefix display
 - Native junction, symbolic-link, hard-link, and reparse-point inspection with non-traversing tree scans, CSV export, and link-only safe deletion
 - Recoverable same-volume quarantine storage with atomic manifests, restore and manual purge controls, configurable retention, batch support, and startup auto-purge
+- Read-only native NTFS MFT size and fragmentation reporting with a physical-placement graph, extent table, partial-result handling, and CSV export
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation

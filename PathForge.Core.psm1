@@ -358,6 +358,250 @@ public static class PathForgeLinkNative {
 "@
 }
 
+if (-not ('PathForgeNtfsNative' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class PathForgeNtfsVolumeData {
+    public long VolumeSerialNumber { get; set; }
+    public long NumberSectors { get; set; }
+    public long TotalClusters { get; set; }
+    public long FreeClusters { get; set; }
+    public long TotalReserved { get; set; }
+    public uint BytesPerSector { get; set; }
+    public uint BytesPerCluster { get; set; }
+    public uint BytesPerFileRecordSegment { get; set; }
+    public uint ClustersPerFileRecordSegment { get; set; }
+    public long MftValidDataLength { get; set; }
+    public long MftStartLcn { get; set; }
+    public long Mft2StartLcn { get; set; }
+    public long MftZoneStart { get; set; }
+    public long MftZoneEnd { get; set; }
+}
+
+public sealed class PathForgeFileExtent {
+    public long StartingVcn { get; set; }
+    public long NextVcn { get; set; }
+    public long Lcn { get; set; }
+}
+
+public static class PathForgeNtfsNative {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    private const uint FSCTL_GET_NTFS_VOLUME_DATA = 0x00090064;
+    private const uint FSCTL_GET_RETRIEVAL_POINTERS = 0x00090073;
+    private const int ERROR_HANDLE_EOF = 38;
+    private const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeNtfsVolumeData {
+        public long VolumeSerialNumber;
+        public long NumberSectors;
+        public long TotalClusters;
+        public long FreeClusters;
+        public long TotalReserved;
+        public uint BytesPerSector;
+        public uint BytesPerCluster;
+        public uint BytesPerFileRecordSegment;
+        public uint ClustersPerFileRecordSegment;
+        public long MftValidDataLength;
+        public long MftStartLcn;
+        public long Mft2StartLcn;
+        public long MftZoneStart;
+        public long MftZoneEnd;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint controlCode,
+        IntPtr inputBuffer,
+        int inputBufferSize,
+        out NativeNtfsVolumeData outputBuffer,
+        int outputBufferSize,
+        out int bytesReturned,
+        IntPtr overlapped);
+
+    [DllImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)]
+    private static extern bool DeviceIoControlBuffer(
+        SafeFileHandle device,
+        uint controlCode,
+        byte[] inputBuffer,
+        int inputBufferSize,
+        byte[] outputBuffer,
+        int outputBufferSize,
+        out int bytesReturned,
+        IntPtr overlapped);
+
+    private static string NormalizeDrive(string drive) {
+        if (String.IsNullOrWhiteSpace(drive)) {
+            throw new ArgumentException("A drive in X: format is required.", "drive");
+        }
+        string normalized = drive.Trim().TrimEnd('\\');
+        if (normalized.Length != 2 || normalized[1] != ':' || !Char.IsLetter(normalized[0])) {
+            throw new ArgumentException("A drive in X: format is required.", "drive");
+        }
+        return Char.ToUpperInvariant(normalized[0]) + ":";
+    }
+
+    private static SafeFileHandle OpenHandle(string path, uint flags) {
+        uint shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        SafeFileHandle handle = CreateFileW(path, GENERIC_READ, shareMode, IntPtr.Zero, OPEN_EXISTING, flags, IntPtr.Zero);
+        if (!handle.IsInvalid) {
+            return handle;
+        }
+
+        handle.Dispose();
+        handle = CreateFileW(path, 0, shareMode, IntPtr.Zero, OPEN_EXISTING, flags, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error, "Cannot open " + path);
+        }
+        return handle;
+    }
+
+    public static PathForgeNtfsVolumeData GetVolumeData(string drive) {
+        string normalized = NormalizeDrive(drive);
+        string volumePath = @"\\.\" + normalized;
+        using (SafeFileHandle handle = OpenHandle(volumePath, 0)) {
+            NativeNtfsVolumeData nativeData;
+            int bytesReturned;
+            int outputSize = Marshal.SizeOf(typeof(NativeNtfsVolumeData));
+            if (!DeviceIoControl(
+                    handle,
+                    FSCTL_GET_NTFS_VOLUME_DATA,
+                    IntPtr.Zero,
+                    0,
+                    out nativeData,
+                    outputSize,
+                    out bytesReturned,
+                    IntPtr.Zero)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "FSCTL_GET_NTFS_VOLUME_DATA failed");
+            }
+            if (bytesReturned < outputSize) {
+                throw new InvalidDataException("Windows returned an incomplete NTFS volume data buffer.");
+            }
+
+            return new PathForgeNtfsVolumeData {
+                VolumeSerialNumber = nativeData.VolumeSerialNumber,
+                NumberSectors = nativeData.NumberSectors,
+                TotalClusters = nativeData.TotalClusters,
+                FreeClusters = nativeData.FreeClusters,
+                TotalReserved = nativeData.TotalReserved,
+                BytesPerSector = nativeData.BytesPerSector,
+                BytesPerCluster = nativeData.BytesPerCluster,
+                BytesPerFileRecordSegment = nativeData.BytesPerFileRecordSegment,
+                ClustersPerFileRecordSegment = nativeData.ClustersPerFileRecordSegment,
+                MftValidDataLength = nativeData.MftValidDataLength,
+                MftStartLcn = nativeData.MftStartLcn,
+                Mft2StartLcn = nativeData.Mft2StartLcn,
+                MftZoneStart = nativeData.MftZoneStart,
+                MftZoneEnd = nativeData.MftZoneEnd
+            };
+        }
+    }
+
+    public static PathForgeFileExtent[] GetFileExtents(string path) {
+        if (String.IsNullOrWhiteSpace(path)) {
+            throw new ArgumentException("A file path is required.", "path");
+        }
+
+        string fullPath = Path.GetFullPath(path);
+        if (!fullPath.StartsWith(@"\\?\", StringComparison.Ordinal)) {
+            fullPath = @"\\?\" + fullPath;
+        }
+
+        using (SafeFileHandle handle = OpenHandle(fullPath, FILE_FLAG_BACKUP_SEMANTICS)) {
+            List<PathForgeFileExtent> extents = new List<PathForgeFileExtent>();
+            long requestedVcn = 0;
+            byte[] output = new byte[1024 * 1024];
+
+            for (int requestIndex = 0; requestIndex < 128; requestIndex++) {
+                byte[] input = BitConverter.GetBytes(requestedVcn);
+                int bytesReturned;
+                bool success = DeviceIoControlBuffer(
+                    handle,
+                    FSCTL_GET_RETRIEVAL_POINTERS,
+                    input,
+                    input.Length,
+                    output,
+                    output.Length,
+                    out bytesReturned,
+                    IntPtr.Zero);
+                int error = success ? 0 : Marshal.GetLastWin32Error();
+
+                if (!success && error == ERROR_HANDLE_EOF && bytesReturned == 0) {
+                    break;
+                }
+                if (!success && error != ERROR_MORE_DATA) {
+                    throw new Win32Exception(error, "FSCTL_GET_RETRIEVAL_POINTERS failed");
+                }
+                if (bytesReturned < 16) {
+                    throw new InvalidDataException("Windows returned an incomplete retrieval-pointers buffer.");
+                }
+
+                uint extentCount = BitConverter.ToUInt32(output, 0);
+                long currentVcn = BitConverter.ToInt64(output, 8);
+                long requiredBytes = 16L + (long)extentCount * 16L;
+                if (requiredBytes > bytesReturned) {
+                    throw new InvalidDataException("The retrieval-pointers extent count exceeds the returned buffer.");
+                }
+
+                for (uint extentIndex = 0; extentIndex < extentCount; extentIndex++) {
+                    int offset = 16 + (int)extentIndex * 16;
+                    long nextVcn = BitConverter.ToInt64(output, offset);
+                    long lcn = BitConverter.ToInt64(output, offset + 8);
+                    long effectiveStart = Math.Max(currentVcn, requestedVcn);
+                    if (nextVcn > effectiveStart) {
+                        long effectiveLcn = lcn < 0 ? lcn : lcn + (effectiveStart - currentVcn);
+                        extents.Add(new PathForgeFileExtent {
+                            StartingVcn = effectiveStart,
+                            NextVcn = nextVcn,
+                            Lcn = effectiveLcn
+                        });
+                    }
+                    currentVcn = nextVcn;
+                }
+
+                if (success) {
+                    return extents.ToArray();
+                }
+                if (currentVcn <= requestedVcn) {
+                    throw new InvalidDataException("Retrieval-pointer pagination did not advance.");
+                }
+                requestedVcn = currentVcn;
+            }
+
+            if (extents.Count == 0) {
+                throw new InvalidDataException("No allocated extents were returned for the file.");
+            }
+            return extents.ToArray();
+        }
+    }
+}
+"@
+}
+
 function Test-SafePath {
     [CmdletBinding()]
     param([string]$Path)
@@ -2214,6 +2458,150 @@ function Invoke-PathForgeDeletionMethod {
     return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Method = 'Auto'; EffectiveMethod = $null; Attempts = $attempts.ToArray(); Error = 'All applicable immediate methods failed' }
 }
 
+function Get-PathForgeNtfsVolumeDataNative {
+    param([Parameter(Mandatory)][string]$Drive)
+    return [PathForgeNtfsNative]::GetVolumeData($Drive)
+}
+
+function Get-PathForgeMftExtentNative {
+    param([Parameter(Mandatory)][string]$Drive)
+    $mftPath = [System.IO.Path]::Combine("$Drive\", '$MFT')
+    return @([PathForgeNtfsNative]::GetFileExtents($mftPath))
+}
+
+function Get-PathForgeMftReport {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]:$')]
+        [string]$Drive
+    )
+
+    $normalizedDrive = $Drive.Substring(0, 1).ToUpperInvariant() + ':'
+    $fileSystem = Get-VolumeFileSystem -Path "$normalizedDrive\"
+    if ($fileSystem -notin @('NTFS', 'Unknown')) {
+        return [PSCustomObject]@{
+            Success            = $false
+            Supported          = $false
+            Drive              = $normalizedDrive
+            FileSystem         = $fileSystem
+            ExtentQuerySuccess = $false
+            Extents            = @()
+            Error              = "The MFT report applies only to NTFS volumes; $normalizedDrive uses $fileSystem."
+        }
+    }
+
+    try {
+        $volumeData = Get-PathForgeNtfsVolumeDataNative -Drive $normalizedDrive
+        $fileSystem = 'NTFS'
+    }
+    catch {
+        $message = $_.Exception.Message
+        if ($message -match 'Access is denied|denied access') {
+            $message = "Administrator access is required to read native NTFS volume data. $message"
+        }
+        return [PSCustomObject]@{
+            Success            = $false
+            Supported          = $fileSystem -eq 'NTFS'
+            Drive              = $normalizedDrive
+            FileSystem         = $fileSystem
+            ExtentQuerySuccess = $false
+            Extents            = @()
+            Error              = $message
+        }
+    }
+
+    $extentError = $null
+    try {
+        $nativeExtents = @(Get-PathForgeMftExtentNative -Drive $normalizedDrive)
+        $extentQuerySuccess = $true
+    }
+    catch {
+        $nativeExtents = @()
+        $extentQuerySuccess = $false
+        $extentError = $_.Exception.Message
+        if ($extentError -match 'Access is denied|denied access') {
+            $extentError = "Administrator access is required to read the MFT extent map. $extentError"
+        }
+    }
+
+    $extents = New-Object 'System.Collections.Generic.List[object]'
+    [int64]$allocatedClusters = 0
+    [int64]$largestExtentClusters = 0
+    for ($index = 0; $index -lt $nativeExtents.Count; $index++) {
+        $nativeExtent = $nativeExtents[$index]
+        [int64]$clusterCount = [Math]::Max(0, ([int64]$nativeExtent.NextVcn - [int64]$nativeExtent.StartingVcn))
+        $isSparse = [int64]$nativeExtent.Lcn -lt 0
+        if (-not $isSparse) {
+            $allocatedClusters += $clusterCount
+            $largestExtentClusters = [Math]::Max($largestExtentClusters, $clusterCount)
+        }
+        $extents.Add([PSCustomObject]@{
+                Index           = $index + 1
+                LogicalStartVcn = [int64]$nativeExtent.StartingVcn
+                LogicalEndVcn   = [int64]$nativeExtent.NextVcn - 1
+                PhysicalStartLcn = [int64]$nativeExtent.Lcn
+                PhysicalEndLcn  = if ($isSparse) { -1 } else { [int64]$nativeExtent.Lcn + $clusterCount - 1 }
+                ClusterCount    = $clusterCount
+                LengthBytes     = $clusterCount * [int64]$volumeData.BytesPerCluster
+                IsSparse        = $isSparse
+            })
+    }
+
+    $allocatedExtentCount = @($extents | Where-Object { -not $_.IsSparse }).Count
+    $fragmentCount = [Math]::Max(0, $allocatedExtentCount - 1)
+    [int64]$mftSizeBytes = [Math]::Max(0, [int64]$volumeData.MftValidDataLength)
+    [int64]$allocatedBytes = $allocatedClusters * [int64]$volumeData.BytesPerCluster
+    [int64]$volumeBytes = [int64]$volumeData.TotalClusters * [int64]$volumeData.BytesPerCluster
+    [int64]$mftZoneClusters = [Math]::Max(0, [int64]$volumeData.MftZoneEnd - [int64]$volumeData.MftZoneStart)
+    [int64]$mftZoneBytes = $mftZoneClusters * [int64]$volumeData.BytesPerCluster
+    [int64]$estimatedRecordCount = if ($volumeData.BytesPerFileRecordSegment -gt 0) {
+        [Math]::Floor($mftSizeBytes / [double]$volumeData.BytesPerFileRecordSegment)
+    }
+    else { 0 }
+    $fragmentationLabel = if (-not $extentQuerySuccess) {
+        'Extent map unavailable'
+    }
+    elseif ($allocatedExtentCount -le 1) {
+        'Contiguous (1 extent)'
+    }
+    else {
+        "Fragmented ($allocatedExtentCount extents)"
+    }
+
+    return [PSCustomObject]@{
+        Success                   = $true
+        Supported                 = $true
+        Drive                     = $normalizedDrive
+        FileSystem                = $fileSystem
+        QueryTimeUtc              = [DateTimeOffset]::UtcNow
+        VolumeSerialNumber        = [int64]$volumeData.VolumeSerialNumber
+        VolumeBytes               = $volumeBytes
+        TotalClusters             = [int64]$volumeData.TotalClusters
+        FreeClusters              = [int64]$volumeData.FreeClusters
+        BytesPerSector            = [uint32]$volumeData.BytesPerSector
+        BytesPerCluster           = [uint32]$volumeData.BytesPerCluster
+        BytesPerFileRecordSegment = [uint32]$volumeData.BytesPerFileRecordSegment
+        MftSizeBytes              = $mftSizeBytes
+        MftAllocatedBytes         = $allocatedBytes
+        EstimatedRecordCount      = $estimatedRecordCount
+        MftStartLcn               = [int64]$volumeData.MftStartLcn
+        MftMirrorStartLcn         = [int64]$volumeData.Mft2StartLcn
+        MftZoneStartLcn           = [int64]$volumeData.MftZoneStart
+        MftZoneEndLcn             = [int64]$volumeData.MftZoneEnd
+        MftZoneBytes              = $mftZoneBytes
+        ExtentQuerySuccess        = $extentQuerySuccess
+        ExtentCount               = $allocatedExtentCount
+        FragmentCount             = $fragmentCount
+        IsFragmented              = $allocatedExtentCount -gt 1
+        FragmentationLabel        = $fragmentationLabel
+        LargestExtentBytes        = $largestExtentClusters * [int64]$volumeData.BytesPerCluster
+        Extents                   = $extents.ToArray()
+        ExtentError               = $extentError
+        Error                     = $null
+    }
+}
+
 function Get-DriveSmartHealth {
     [CmdletBinding()]
     param([string]$Drive)
@@ -2685,6 +3073,7 @@ Export-ModuleMember -Function @(
     'Get-PathForgeDeletionPlan',
     'Import-PathForgeDeletionBatch',
     'Invoke-PathForgeDeletionMethod',
+    'Get-PathForgeMftReport',
     'Get-DriveSmartHealth',
     'Get-VolumeCorruptionRecord',
     'Get-PathForgeRepairCommand',

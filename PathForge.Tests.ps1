@@ -10,7 +10,7 @@ BeforeAll {
     $functionNames = @(
         'Get-ValidatedPath', 'Receive-PathDrop', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
         'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth', 'Invoke-ForceDelete', 'Invoke-BootTimeDelete',
-        'Invoke-DeletionBatch',
+        'Invoke-DeletionBatch', 'Invoke-QuarantinePath', 'Invoke-QuarantineStartupMaintenance',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
         'Set-Status', 'Set-Progress',
         'Enter-Operation', 'Exit-Operation', 'Stop-ActiveOperation'
@@ -34,7 +34,10 @@ Describe "PathForge.Core module boundary" {
                 'Test-SafePath', 'Remove-ItemStandard', 'Get-DriveSmartHealth',
                 'Get-PathForgeRepairCommand', 'Get-PathForgeDriveHealth',
                 'Get-PathForgePendingFileQueue', 'Remove-PathForgePendingFileOperation',
-                'Get-PathForgeLinkInfo', 'Find-PathForgeReparsePoint', 'Remove-PathForgeLinkSafe')) {
+                'Get-PathForgeLinkInfo', 'Find-PathForgeReparsePoint', 'Remove-PathForgeLinkSafe',
+                'Get-PathForgeQuarantineItem', 'Move-PathForgeToQuarantine',
+                'Restore-PathForgeQuarantineItem', 'Remove-PathForgeQuarantineItem',
+                'Invoke-PathForgeQuarantineMaintenance')) {
             (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
         }
     }
@@ -115,7 +118,9 @@ Describe "PathForge.Core module boundary" {
         foreach ($commandName in @(
                 'Move-ToRecycleBin', 'Remove-ItemStandard', 'Remove-ItemDotNet',
                 'Remove-ItemLongPath', 'Remove-ItemShortName', 'Remove-ItemRobocopy',
-                'Remove-ItemWMI', 'Remove-ReparsePointSafe', 'Register-BootTimeDelete')) {
+                'Remove-ItemWMI', 'Remove-ReparsePointSafe', 'Register-BootTimeDelete',
+                'Move-PathForgeToQuarantine', 'Restore-PathForgeQuarantineItem',
+                'Remove-PathForgeQuarantineItem', 'Invoke-PathForgeQuarantineMaintenance')) {
             (Get-Command $commandName).Parameters.ContainsKey('WhatIf') | Should -BeTrue
         }
     }
@@ -236,6 +241,146 @@ Describe "PathForge.Core module boundary" {
         Test-Path -LiteralPath $previewTarget | Should -BeTrue
         $live.Success | Should -BeTrue
         Test-Path -LiteralPath $liveTarget | Should -BeFalse
+    }
+
+    It "imports and previews the quarantine batch method" {
+        $batchPath = Join-Path $TestDrive 'quarantine-batch.csv'
+        $target = Join-Path $TestDrive 'quarantine-batch-target.txt'
+        Set-Content -LiteralPath $target -Value 'keep in preview'
+        @('Path,Method,DryRun', "`"$target`",quarantine,true") | Set-Content -LiteralPath $batchPath
+
+        $record = @(Import-PathForgeDeletionBatch -Path $batchPath)[0]
+        $preview = Invoke-PathForgeDeletionMethod -Path $target -Method $record.Method -WhatIf
+
+        $record.Valid | Should -BeTrue
+        $record.Method | Should -Be 'Quarantine'
+        $preview.Success | Should -BeTrue
+        $preview.Simulated | Should -BeTrue
+        $preview.EffectiveMethod | Should -Be 'Quarantine'
+        Test-Path -LiteralPath $target | Should -BeTrue
+    }
+
+    It "quarantines and restores a file from its recovery manifest" {
+        $root = Join-Path $TestDrive 'quarantine-zone'
+        $target = Join-Path $TestDrive 'quarantine-me.txt'
+        Set-Content -LiteralPath $target -Value 'recoverable content'
+
+        $move = Move-PathForgeToQuarantine -Path $target -RootPath $root -RetentionDays 14 -Confirm:$false
+        $items = @(Get-PathForgeQuarantineItem -RootPath $root -RetentionDays 14)
+        $manifest = Get-Content -Raw -LiteralPath (Join-Path $move.EntryPath 'manifest.json') | ConvertFrom-Json
+
+        $move.Success | Should -BeTrue
+        Test-Path -LiteralPath $target | Should -BeFalse
+        $items.Count | Should -Be 1
+        $items[0].OriginalPath | Should -Be $target
+        $items[0].PurgeAfterUtc | Should -BeGreaterThan $items[0].QuarantinedAtUtc
+        $manifest.State | Should -Be 'Quarantined'
+        Get-Content -LiteralPath $items[0].PayloadPath | Should -Be 'recoverable content'
+
+        $restore = Restore-PathForgeQuarantineItem -Id $move.Id -RootPath $root -Confirm:$false
+
+        $restore.Success | Should -BeTrue
+        Get-Content -LiteralPath $target | Should -Be 'recoverable content'
+        Test-Path -LiteralPath $move.EntryPath | Should -BeFalse
+    }
+
+    It "keeps a quarantine preview free of filesystem side effects" {
+        $root = Join-Path $TestDrive 'preview-zone'
+        $target = Join-Path $TestDrive 'preview-quarantine.txt'
+        Set-Content -LiteralPath $target -Value 'stay here'
+
+        $result = Move-PathForgeToQuarantine -Path $target -RootPath $root -RetentionDays 30 -WhatIf
+
+        $result.Success | Should -BeTrue
+        $result.Simulated | Should -BeTrue
+        Test-Path -LiteralPath $target | Should -BeTrue
+        Test-Path -LiteralPath $root | Should -BeFalse
+    }
+
+    It "auto-purges items after the configured retention window" {
+        $root = Join-Path $TestDrive 'expiry-zone'
+        $target = Join-Path $TestDrive 'expire-me.txt'
+        Set-Content -LiteralPath $target -Value 'expired content'
+        $move = Move-PathForgeToQuarantine -Path $target -RootPath $root -RetentionDays 30 -Confirm:$false
+
+        $result = Invoke-PathForgeQuarantineMaintenance -RootPath $root -RetentionDays 1 `
+            -Now ([DateTimeOffset]::UtcNow.AddDays(2)) -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.Purged | Should -Be 1
+        Test-Path -LiteralPath $move.EntryPath | Should -BeFalse
+        Test-Path -LiteralPath $target | Should -BeFalse
+    }
+
+    It "purges a quarantined tree without traversing nested junctions" {
+        $root = Join-Path $TestDrive 'junction-quarantine-zone'
+        $outsideTarget = Join-Path $TestDrive 'outside-quarantine-target'
+        $sourceDirectory = Join-Path $TestDrive 'directory-with-junction'
+        $junctionPath = Join-Path $sourceDirectory 'outside-link'
+        New-Item -ItemType Directory -Path $outsideTarget, $sourceDirectory | Out-Null
+        Set-Content -LiteralPath (Join-Path $outsideTarget 'keep.txt') -Value 'must survive purge'
+        New-Item -ItemType Junction -Path $junctionPath -Target $outsideTarget | Out-Null
+
+        $move = Move-PathForgeToQuarantine -Path $sourceDirectory -RootPath $root -RetentionDays 30 -Confirm:$false
+        $purge = Remove-PathForgeQuarantineItem -Id $move.Id -RootPath $root -Confirm:$false
+
+        $move.Success | Should -BeTrue
+        $purge.Success | Should -BeTrue
+        Test-Path -LiteralPath $move.EntryPath | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $outsideTarget 'keep.txt') | Should -BeTrue
+    }
+
+    It "refuses to quarantine a reparse point" {
+        $root = Join-Path $TestDrive 'reparse-refusal-zone'
+        $outsideTarget = Join-Path $TestDrive 'reparse-refusal-target'
+        $junctionPath = Join-Path $TestDrive 'reparse-refusal-link'
+        New-Item -ItemType Directory -Path $outsideTarget | Out-Null
+        New-Item -ItemType Junction -Path $junctionPath -Target $outsideTarget | Out-Null
+
+        $result = Move-PathForgeToQuarantine -Path $junctionPath -RootPath $root -RetentionDays 30 -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.Error | Should -Match 'Reparse points cannot be quarantined'
+        Test-Path -LiteralPath $junctionPath | Should -BeTrue
+        Test-Path -LiteralPath $outsideTarget | Should -BeTrue
+    }
+
+    It "treats a quarantine record replaced by a junction as invalid" {
+        $root = Join-Path $TestDrive 'tampered-quarantine-zone'
+        $outsideTarget = Join-Path $TestDrive 'tampered-record-target'
+        $id = '0123456789abcdef0123456789abcdef'
+        $entryPath = Join-Path $root $id
+        New-Item -ItemType Directory -Path $root, $outsideTarget | Out-Null
+        Set-Content -LiteralPath (Join-Path $outsideTarget 'keep.txt') -Value 'never traverse tampered record'
+        New-Item -ItemType Junction -Path $entryPath -Target $outsideTarget | Out-Null
+
+        $items = @(Get-PathForgeQuarantineItem -RootPath $root -RetentionDays 30)
+        $purge = Remove-PathForgeQuarantineItem -Id $id -RootPath $root -Confirm:$false
+
+        $items.Count | Should -Be 1
+        $items[0].Valid | Should -BeFalse
+        $items[0].Error | Should -Match 'cannot be a reparse point'
+        $purge.Success | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $outsideTarget 'keep.txt') | Should -BeTrue
+    }
+
+    It "persists retention policy updates and fails closed on corruption" {
+        $policyPath = Join-Path $TestDrive 'quarantine-policy.json'
+        $first = Set-PathForgeQuarantinePolicy -RetentionDays 45 -ConfigPath $policyPath -Confirm:$false
+        $second = Set-PathForgeQuarantinePolicy -RetentionDays 60 -ConfigPath $policyPath -Confirm:$false
+        $loaded = Get-PathForgeQuarantinePolicy -ConfigPath $policyPath
+
+        $first.Success | Should -BeTrue
+        $second.Success | Should -BeTrue
+        $loaded.Success | Should -BeTrue
+        $loaded.RetentionDays | Should -Be 60
+
+        Set-Content -LiteralPath $policyPath -Value '{ invalid json'
+        $maintenance = Invoke-PathForgeQuarantineMaintenance -ConfigPath $policyPath -Confirm:$false
+
+        $maintenance.Success | Should -BeFalse
+        $maintenance.Purged | Should -Be 0
+        $maintenance.Errors[0] | Should -Match 'policy is invalid'
     }
 
     It "parses pending delete, move, replace, and malformed queue entries" {
@@ -767,6 +912,62 @@ Describe "Link inspector and reparse explorer" {
         $functionText.IndexOf('if (Test-ReparsePoint') | Should -BeLessThan $functionText.IndexOf('Attempting Recycle Bin')
         $functionText | Should -Match 'Refusing generic deletion of reparse point'
         $functionText | Should -Match 'Link deletion cancelled; no fallback method was run'
+    }
+}
+
+Describe "Quarantine zone GUI" {
+    It "exposes recoverable quarantine management from File Operations" {
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+        $managerAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-QuarantineManager'
+        }, $true) | Select-Object -First 1
+
+        $fileOpsAst.Extent.Text | Should -Match 'Title "Quarantine Zone"'
+        $fileOpsAst.Extent.Text | Should -Match 'BtnText "Open Zone"'
+        $fileOpsAst.Extent.Text | Should -Match 'Show-QuarantineManager'
+        $managerAst.Extent.Text | Should -Match 'QuarantineGrid'
+        $managerAst.Extent.Text | Should -Match 'Quarantine Current'
+        $managerAst.Extent.Text | Should -Match 'Restore Selected'
+        $managerAst.Extent.Text | Should -Match 'Purge Selected'
+        $managerAst.Extent.Text | Should -Match 'Purge Expired'
+        $managerAst.Extent.Text | Should -Match 'QuarantineRetentionDays'
+        $managerAst.Extent.Text | Should -Match 'Set-PathForgeQuarantinePolicy'
+    }
+
+    It "runs retention maintenance when the application is shown" {
+        $startAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Start-Application'
+        }, $true) | Select-Object -First 1
+
+        $startAst.Extent.Text | Should -Match 'Add_Shown'
+        $startAst.Extent.Text | Should -Match 'Invoke-QuarantineStartupMaintenance'
+    }
+
+    It "previews a quarantine move without prompting or mutating" {
+        $target = Join-Path $TestDrive 'gui-quarantine-preview.txt'
+        Set-Content -LiteralPath $target -Value 'preserve GUI preview'
+        Mock Write-Console
+        Mock Move-PathForgeToQuarantine {
+            [PSCustomObject]@{
+                Success = $true
+                Simulated = $true
+                RootPath = (Join-Path $TestDrive 'preview-root')
+                PurgeAfterUtc = [DateTimeOffset]::UtcNow.AddDays(30)
+                Error = $null
+            }
+        }
+
+        $result = Invoke-QuarantinePath -Path $target -DryRun
+
+        $result.Success | Should -BeTrue
+        $result.Simulated | Should -BeTrue
+        Test-Path -LiteralPath $target | Should -BeTrue
+        Should -Invoke Move-PathForgeToQuarantine -Times 1 -ParameterFilter { $WhatIf }
     }
 }
 

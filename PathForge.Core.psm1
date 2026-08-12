@@ -4,6 +4,8 @@ Add-Type -AssemblyName Microsoft.VisualBasic
 
 $Script:PathForgeSessionManagerRegistryPath = 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager'
 $Script:PathForgePendingFileValueName = 'PendingFileRenameOperations'
+$Script:PathForgeQuarantineDirectoryName = 'PathForge.Quarantine'
+$Script:PathForgeQuarantineSchemaVersion = 1
 
 if (-not ('PathForgeBootDeleteNative' -as [type])) {
     Add-Type -TypeDefinition @"
@@ -893,6 +895,721 @@ function Remove-ReparsePointSafe {
     return [bool]$result.Success
 }
 
+function Test-PathForgePathWithinRoot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RootPath
+    )
+
+    $candidate = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetFullPath($RootPath)
+    $trimCharacters = [char[]]@('\', '/')
+    $candidateComparable = $candidate.TrimEnd($trimCharacters)
+    $rootComparable = $root.TrimEnd($trimCharacters)
+
+    if ($candidateComparable.Equals($rootComparable, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    $rootPrefix = $root
+    if (-not $rootPrefix.EndsWith([System.IO.Path]::DirectorySeparatorChar.ToString())) {
+        $rootPrefix += [System.IO.Path]::DirectorySeparatorChar
+    }
+    return $candidate.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PathForgeQuarantineRoot {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        throw $check.Reason
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $volumeRoot = [System.IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($volumeRoot)) {
+        throw "Cannot determine the filesystem root for $Path"
+    }
+    return [System.IO.Path]::Combine($volumeRoot, $Script:PathForgeQuarantineDirectoryName)
+}
+
+function Get-PathForgeQuarantinePolicyPath {
+    param([string]$ConfigPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        return [System.IO.Path]::GetFullPath($ConfigPath)
+    }
+
+    $localAppData = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if ([string]::IsNullOrWhiteSpace($localAppData)) {
+        $localAppData = $env:TEMP
+    }
+    return [System.IO.Path]::Combine($localAppData, 'PathForge', 'quarantine-policy.json')
+}
+
+function Write-PathForgeJsonAtomic {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][object]$Value
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $parentPath = [System.IO.Path]::GetDirectoryName($fullPath)
+    if ([string]::IsNullOrWhiteSpace($parentPath)) {
+        throw "Cannot determine the parent directory for $Path"
+    }
+    $null = [System.IO.Directory]::CreateDirectory($parentPath)
+
+    $temporaryPath = [System.IO.Path]::Combine(
+        $parentPath,
+        ".pathforge-$([Guid]::NewGuid().ToString('N')).tmp")
+    $backupPath = [System.IO.Path]::Combine(
+        $parentPath,
+        ".pathforge-$([Guid]::NewGuid().ToString('N')).bak")
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    try {
+        $json = $Value | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText($temporaryPath, $json + [Environment]::NewLine, $encoding)
+        if ([System.IO.File]::Exists($fullPath)) {
+            [System.IO.File]::Replace($temporaryPath, $fullPath, $backupPath)
+        }
+        else {
+            [System.IO.File]::Move($temporaryPath, $fullPath)
+        }
+    }
+    finally {
+        if ([System.IO.File]::Exists($temporaryPath)) {
+            [System.IO.File]::Delete($temporaryPath)
+        }
+        if ([System.IO.File]::Exists($backupPath)) {
+            [System.IO.File]::Delete($backupPath)
+        }
+    }
+}
+
+function Get-PathForgeQuarantinePolicy {
+    [CmdletBinding()]
+    param([string]$ConfigPath)
+
+    $policyPath = Get-PathForgeQuarantinePolicyPath -ConfigPath $ConfigPath
+    $defaultRetentionDays = 30
+    if (-not [System.IO.File]::Exists($policyPath)) {
+        return [PSCustomObject]@{
+            Success       = $true
+            ConfigPath    = $policyPath
+            RetentionDays = $defaultRetentionDays
+            IsDefault     = $true
+            Error         = $null
+        }
+    }
+
+    try {
+        $policy = Get-Content -Raw -LiteralPath $policyPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        [int]$retentionDays = $policy.RetentionDays
+        if ($retentionDays -lt 1 -or $retentionDays -gt 3650) {
+            throw 'RetentionDays must be between 1 and 3650.'
+        }
+        return [PSCustomObject]@{
+            Success       = $true
+            ConfigPath    = $policyPath
+            RetentionDays = $retentionDays
+            IsDefault     = $false
+            Error         = $null
+        }
+    }
+    catch {
+        return [PSCustomObject]@{
+            Success       = $false
+            ConfigPath    = $policyPath
+            RetentionDays = $defaultRetentionDays
+            IsDefault     = $true
+            Error         = $_.Exception.Message
+        }
+    }
+}
+
+function Set-PathForgeQuarantinePolicy {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 3650)][int]$RetentionDays,
+        [string]$ConfigPath
+    )
+
+    $policyPath = Get-PathForgeQuarantinePolicyPath -ConfigPath $ConfigPath
+    if (-not $PSCmdlet.ShouldProcess($policyPath, "Set quarantine retention to $RetentionDays day(s)")) {
+        return [PSCustomObject]@{Success = $true; Simulated = $true; ConfigPath = $policyPath; RetentionDays = $RetentionDays; Error = $null }
+    }
+
+    try {
+        $policy = [ordered]@{
+            SchemaVersion = $Script:PathForgeQuarantineSchemaVersion
+            RetentionDays = $RetentionDays
+            UpdatedAtUtc  = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+        Write-PathForgeJsonAtomic -Path $policyPath -Value $policy
+        return [PSCustomObject]@{Success = $true; Simulated = $false; ConfigPath = $policyPath; RetentionDays = $RetentionDays; Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; ConfigPath = $policyPath; RetentionDays = $RetentionDays; Error = $_.Exception.Message }
+    }
+}
+
+function Get-PathForgeQuarantineRootList {
+    param([string[]]$RootPath)
+
+    $roots = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($PSBoundParameters.ContainsKey('RootPath')) {
+        foreach ($candidateRoot in @($RootPath)) {
+            if ([string]::IsNullOrWhiteSpace($candidateRoot)) { continue }
+            $fullRoot = [System.IO.Path]::GetFullPath($candidateRoot)
+            if ([System.IO.Directory]::Exists($fullRoot)) {
+                $rootItem = Get-Item -LiteralPath $fullRoot -Force -ErrorAction SilentlyContinue
+                if (-not $rootItem -or ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    Write-Verbose "Skipping missing or reparse-point quarantine root: $fullRoot"
+                    continue
+                }
+                $null = $roots.Add($fullRoot)
+            }
+        }
+    }
+    else {
+        foreach ($drive in @(Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
+            if ([string]::IsNullOrWhiteSpace([string]$drive.Root)) { continue }
+            try {
+                $candidateRoot = [System.IO.Path]::Combine([string]$drive.Root, $Script:PathForgeQuarantineDirectoryName)
+                if ([System.IO.Directory]::Exists($candidateRoot)) {
+                    $rootItem = Get-Item -LiteralPath $candidateRoot -Force -ErrorAction SilentlyContinue
+                    if ($rootItem -and ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+                        $null = $roots.Add([System.IO.Path]::GetFullPath($candidateRoot))
+                    }
+                }
+            }
+            catch {
+                Write-Verbose "Cannot inspect quarantine root for drive $($drive.Name): $_"
+            }
+        }
+    }
+
+    return @($roots)
+}
+
+function Initialize-PathForgeQuarantineRoot {
+    param(
+        [Parameter(Mandatory)][string]$RootPath,
+        [switch]$HardenAccess
+    )
+
+    $fullRoot = [System.IO.Path]::GetFullPath($RootPath)
+    $volumeRoot = [System.IO.Path]::GetPathRoot($fullRoot)
+    if ([string]::IsNullOrWhiteSpace($volumeRoot) -or
+        $fullRoot.TrimEnd([char[]]@('\', '/')).Equals($volumeRoot.TrimEnd([char[]]@('\', '/')), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The quarantine root cannot be a filesystem root.'
+    }
+
+    $null = [System.IO.Directory]::CreateDirectory($fullRoot)
+    $rootItem = Get-Item -LiteralPath $fullRoot -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The quarantine root cannot be a reparse point.'
+    }
+
+    $warning = $null
+    if ($HardenAccess) {
+        try {
+            [System.IO.File]::SetAttributes($fullRoot, $rootItem.Attributes -bor [System.IO.FileAttributes]::Hidden)
+            $icacls = Get-Command icacls.exe -ErrorAction SilentlyContinue
+            if ($icacls) {
+                $null = & $icacls.Source $fullRoot '/inheritance:r' '/grant:r' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $warning = "Could not restrict quarantine ACLs (icacls exit code $LASTEXITCODE)."
+                }
+            }
+            else {
+                $warning = 'icacls.exe is unavailable; quarantine ACLs were not restricted.'
+            }
+        }
+        catch {
+            $warning = "Could not harden quarantine storage: $($_.Exception.Message)"
+        }
+    }
+
+    return [PSCustomObject]@{RootPath = $fullRoot; Warning = $warning }
+}
+
+function Get-PathForgeQuarantineItem {
+    [CmdletBinding()]
+    param(
+        [string[]]$RootPath,
+        [ValidateRange(1, 3650)][int]$RetentionDays,
+        [string]$ConfigPath
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('RetentionDays')) {
+        $RetentionDays = (Get-PathForgeQuarantinePolicy -ConfigPath $ConfigPath).RetentionDays
+    }
+    $roots = if ($PSBoundParameters.ContainsKey('RootPath')) {
+        @(Get-PathForgeQuarantineRootList -RootPath $RootPath)
+    }
+    else {
+        @(Get-PathForgeQuarantineRootList)
+    }
+
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($root in $roots) {
+        foreach ($entry in @(Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue)) {
+            $id = [string]$entry.Name
+            if ($id -notmatch '^[A-Fa-f0-9]{32}$') { continue }
+
+            $manifestPath = [System.IO.Path]::Combine($entry.FullName, 'manifest.json')
+            $payloadPath = [System.IO.Path]::Combine($entry.FullName, 'payload')
+            try {
+                if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw 'Quarantine entry directory cannot be a reparse point.'
+                }
+                $manifest = Get-Content -Raw -LiteralPath $manifestPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                if ([int]$manifest.SchemaVersion -ne $Script:PathForgeQuarantineSchemaVersion) {
+                    throw "Unsupported manifest schema $($manifest.SchemaVersion)."
+                }
+                if (-not ([string]$manifest.Id).Equals($id, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'Manifest ID does not match its quarantine directory.'
+                }
+
+                $quarantinedAtUtc = [DateTimeOffset]::MinValue
+                if (-not [DateTimeOffset]::TryParse(
+                        [string]$manifest.QuarantinedAtUtc,
+                        [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::RoundtripKind,
+                        [ref]$quarantinedAtUtc)) {
+                    throw 'Manifest quarantine timestamp is invalid.'
+                }
+                if (-not [System.IO.File]::Exists($payloadPath) -and -not [System.IO.Directory]::Exists($payloadPath)) {
+                    throw 'Quarantined payload is missing.'
+                }
+                $payloadItem = Get-Item -LiteralPath $payloadPath -Force -ErrorAction Stop
+                if (($payloadItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw 'Quarantined payload cannot be a reparse point.'
+                }
+
+                $manifestState = [string]$manifest.State
+                $items.Add([PSCustomObject]@{
+                        Id                 = $id
+                        RootPath           = $root
+                        EntryPath          = $entry.FullName
+                        PayloadPath        = $payloadPath
+                        OriginalPath       = [string]$manifest.OriginalPath
+                        OriginalName       = [string]$manifest.OriginalName
+                        IsContainer        = [bool]$manifest.IsContainer
+                        LengthBytes        = [int64]$manifest.LengthBytes
+                        QuarantinedAtUtc   = $quarantinedAtUtc
+                        PurgeAfterUtc      = $quarantinedAtUtc.AddDays($RetentionDays)
+                        RecordedRetention  = [int]$manifest.RetentionDays
+                        Valid              = $manifestState -in @('Quarantined', 'Prepared')
+                        Status             = $manifestState
+                        Error              = $null
+                    })
+            }
+            catch {
+                $items.Add([PSCustomObject]@{
+                        Id                 = $id
+                        RootPath           = $root
+                        EntryPath          = $entry.FullName
+                        PayloadPath        = $payloadPath
+                        OriginalPath       = '(unavailable)'
+                        OriginalName       = $id
+                        IsContainer        = $true
+                        LengthBytes        = 0
+                        QuarantinedAtUtc   = $null
+                        PurgeAfterUtc      = $null
+                        RecordedRetention  = 0
+                        Valid              = $false
+                        Status             = 'Invalid'
+                        Error              = $_.Exception.Message
+                    })
+            }
+        }
+    }
+
+    return @($items.ToArray() | Sort-Object QuarantinedAtUtc -Descending)
+}
+
+function Resolve-PathForgeQuarantineEntry {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [string[]]$RootPath
+    )
+
+    if ($Id -notmatch '^[A-Fa-f0-9]{32}$') {
+        throw 'A quarantine item ID must be a 32-character hexadecimal GUID.'
+    }
+    $roots = if ($PSBoundParameters.ContainsKey('RootPath')) {
+        @(Get-PathForgeQuarantineRootList -RootPath $RootPath)
+    }
+    else {
+        @(Get-PathForgeQuarantineRootList)
+    }
+
+    $matchedEntries = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($root in $roots) {
+        $entryPath = [System.IO.Path]::Combine($root, $Id)
+        if ([System.IO.Directory]::Exists($entryPath) -and (Test-PathForgePathWithinRoot -Path $entryPath -RootPath $root)) {
+            $entryItem = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
+            if (($entryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Quarantine entry directory cannot be a reparse point.'
+            }
+            $matchedEntries.Add([PSCustomObject]@{RootPath = $root; EntryPath = $entryPath; PayloadPath = [System.IO.Path]::Combine($entryPath, 'payload') })
+        }
+    }
+    if ($matchedEntries.Count -eq 0) {
+        throw "Quarantine item not found: $Id"
+    }
+    if ($matchedEntries.Count -gt 1) {
+        throw "Quarantine item ID is ambiguous across storage roots: $Id"
+    }
+    return $matchedEntries[0]
+}
+
+function Invoke-PathForgeTreeRemovalNoFollow {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $rootItem = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $rootIsReparse = ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($rootIsReparse) {
+        if ($rootItem.PSIsContainer) {
+            [PathForgeLinkNative]::DeleteDirectoryLink($rootItem.FullName)
+        }
+        else {
+            [PathForgeLinkNative]::DeleteFileLink($rootItem.FullName)
+        }
+        return
+    }
+    if (-not $rootItem.PSIsContainer) {
+        [System.IO.File]::SetAttributes($rootItem.FullName, [System.IO.FileAttributes]::Normal)
+        [System.IO.File]::Delete($rootItem.FullName)
+        return
+    }
+
+    $directories = New-Object 'System.Collections.Generic.List[string]'
+    $leaves = New-Object 'System.Collections.Generic.List[object]'
+    $pending = New-Object 'System.Collections.Generic.Queue[string]'
+    $directories.Add($rootItem.FullName)
+    $pending.Enqueue($rootItem.FullName)
+
+    while ($pending.Count -gt 0) {
+        $directoryPath = $pending.Dequeue()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directoryPath -Force -ErrorAction Stop)) {
+            $isReparse = ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            if ($child.PSIsContainer -and -not $isReparse) {
+                $directories.Add($child.FullName)
+                $pending.Enqueue($child.FullName)
+            }
+            else {
+                $leaves.Add([PSCustomObject]@{Path = $child.FullName; IsContainer = [bool]$child.PSIsContainer; IsReparse = $isReparse })
+            }
+        }
+    }
+
+    foreach ($leaf in $leaves) {
+        if ($leaf.IsReparse) {
+            if ($leaf.IsContainer) {
+                [PathForgeLinkNative]::DeleteDirectoryLink($leaf.Path)
+            }
+            else {
+                [PathForgeLinkNative]::DeleteFileLink($leaf.Path)
+            }
+        }
+        else {
+            [System.IO.File]::SetAttributes($leaf.Path, [System.IO.FileAttributes]::Normal)
+            [System.IO.File]::Delete($leaf.Path)
+        }
+    }
+    for ($index = $directories.Count - 1; $index -ge 0; $index--) {
+        [System.IO.Directory]::Delete($directories[$index], $false)
+    }
+}
+
+function Move-PathForgeToQuarantine {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$RootPath,
+        [ValidateRange(1, 3650)][int]$RetentionDays,
+        [string]$ConfigPath
+    )
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Error = $check.Reason }
+    }
+    try {
+        $sourceItem = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        $sourcePath = $sourceItem.FullName
+        $sourceVolume = [System.IO.Path]::GetPathRoot($sourcePath)
+        if ($sourcePath.TrimEnd([char[]]@('\', '/')).Equals($sourceVolume.TrimEnd([char[]]@('\', '/')), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'A filesystem root cannot be quarantined.'
+        }
+        if (($sourceItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Reparse points cannot be quarantined; inspect and remove the link with Link Inspector.'
+        }
+
+        $rootWasExplicit = $PSBoundParameters.ContainsKey('RootPath')
+        $resolvedRoot = if ($rootWasExplicit) {
+            [System.IO.Path]::GetFullPath($RootPath)
+        }
+        else {
+            Get-PathForgeQuarantineRoot -Path $sourcePath
+        }
+        if ((Test-PathForgePathWithinRoot -Path $sourcePath -RootPath $resolvedRoot) -or
+            (Test-PathForgePathWithinRoot -Path $resolvedRoot -RootPath $sourcePath)) {
+            throw 'The source and quarantine root cannot contain one another.'
+        }
+
+        $destinationVolume = [System.IO.Path]::GetPathRoot($resolvedRoot)
+        if ($sourceItem.PSIsContainer -and
+            -not $sourceVolume.Equals($destinationVolume, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Directories must use a quarantine root on the same volume so the move is complete and non-recursive.'
+        }
+        if (-not $PSBoundParameters.ContainsKey('RetentionDays')) {
+            $policy = Get-PathForgeQuarantinePolicy -ConfigPath $ConfigPath
+            if (-not $policy.Success) {
+                throw "Quarantine policy is invalid: $($policy.Error)"
+            }
+            $RetentionDays = $policy.RetentionDays
+        }
+        if ($RetentionDays -lt 1 -or $RetentionDays -gt 3650) {
+            throw 'RetentionDays must be between 1 and 3650.'
+        }
+
+        $quarantinedAtUtc = [DateTimeOffset]::UtcNow
+        $purgeAfterUtc = $quarantinedAtUtc.AddDays($RetentionDays)
+        if (-not $PSCmdlet.ShouldProcess($sourcePath, "Move to quarantine until $($purgeAfterUtc.ToString('u'))")) {
+            return [PSCustomObject]@{
+                Success = $true; Simulated = $true; Path = $sourcePath; RootPath = $resolvedRoot
+                Id = $null; PurgeAfterUtc = $purgeAfterUtc; Method = 'WhatIf: Quarantine'; Error = $null
+            }
+        }
+
+        $rootState = Initialize-PathForgeQuarantineRoot -RootPath $resolvedRoot -HardenAccess:(-not $rootWasExplicit)
+        $id = [Guid]::NewGuid().ToString('N')
+        $entryPath = [System.IO.Path]::Combine($resolvedRoot, $id)
+        $payloadPath = [System.IO.Path]::Combine($entryPath, 'payload')
+        $manifestPath = [System.IO.Path]::Combine($entryPath, 'manifest.json')
+        $null = [System.IO.Directory]::CreateDirectory($entryPath)
+
+        $manifest = [ordered]@{
+            SchemaVersion        = $Script:PathForgeQuarantineSchemaVersion
+            Id                   = $id
+            State                = 'Prepared'
+            OriginalPath         = $sourcePath
+            OriginalName         = $sourceItem.Name
+            IsContainer          = [bool]$sourceItem.PSIsContainer
+            LengthBytes          = if ($sourceItem.PSIsContainer) { 0 } else { [int64]$sourceItem.Length }
+            OriginalAttributes   = [int64]$sourceItem.Attributes
+            OriginalLastWriteUtc = $sourceItem.LastWriteTimeUtc.ToString('o')
+            QuarantinedAtUtc     = $quarantinedAtUtc.ToString('o')
+            RetentionDays        = $RetentionDays
+        }
+        Write-PathForgeJsonAtomic -Path $manifestPath -Value $manifest
+
+        $moved = $false
+        try {
+            Move-Item -LiteralPath $sourcePath -Destination $payloadPath -ErrorAction Stop
+            $moved = $true
+            $manifest.State = 'Quarantined'
+            Write-PathForgeJsonAtomic -Path $manifestPath -Value $manifest
+        }
+        catch {
+            $moveError = $_.Exception.Message
+            $rollbackError = $null
+            if ($moved -and (Test-Path -LiteralPath $payloadPath) -and -not (Test-Path -LiteralPath $sourcePath)) {
+                try { Move-Item -LiteralPath $payloadPath -Destination $sourcePath -ErrorAction Stop }
+                catch { $rollbackError = $_.Exception.Message }
+            }
+            if (-not $rollbackError -and (Test-Path -LiteralPath $entryPath)) {
+                try { Invoke-PathForgeTreeRemovalNoFollow -Path $entryPath }
+                catch { $rollbackError = $_.Exception.Message }
+            }
+            $detail = if ($rollbackError) { "$moveError Rollback failed: $rollbackError Recovery path: $payloadPath" } else { $moveError }
+            throw $detail
+        }
+
+        return [PSCustomObject]@{
+            Success          = $true
+            Simulated        = $false
+            Path             = $sourcePath
+            OriginalPath     = $sourcePath
+            RootPath         = $resolvedRoot
+            EntryPath        = $entryPath
+            PayloadPath      = $payloadPath
+            Id               = $id
+            QuarantinedAtUtc = $quarantinedAtUtc
+            PurgeAfterUtc    = $purgeAfterUtc
+            Method           = 'Quarantine'
+            Warning          = $rootState.Warning
+            Error            = $null
+        }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Method = 'Quarantine'; Error = $_.Exception.Message }
+    }
+}
+
+function Restore-PathForgeQuarantineItem {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [string[]]$RootPath,
+        [string]$DestinationPath,
+        [string]$ConfigPath
+    )
+
+    try {
+        $entry = if ($PSBoundParameters.ContainsKey('RootPath')) {
+            Resolve-PathForgeQuarantineEntry -Id $Id -RootPath $RootPath
+        }
+        else {
+            Resolve-PathForgeQuarantineEntry -Id $Id
+        }
+        $items = @(Get-PathForgeQuarantineItem -RootPath $entry.RootPath -ConfigPath $ConfigPath)
+        $item = $null
+        foreach ($candidateItem in $items) {
+            if ($candidateItem.Id -eq $Id) {
+                $item = $candidateItem
+                break
+            }
+        }
+        if (-not $item -or -not $item.Valid) {
+            $reason = if ($item) { $item.Error } else { 'Manifest is unavailable.' }
+            throw "Quarantine item cannot be restored: $reason"
+        }
+
+        $destination = if ([string]::IsNullOrWhiteSpace($DestinationPath)) { $item.OriginalPath } else { [System.IO.Path]::GetFullPath($DestinationPath) }
+        $destinationCheck = Test-SafePath -Path $destination
+        if (-not $destinationCheck.Valid) { throw $destinationCheck.Reason }
+        if (Test-PathForgePathWithinRoot -Path $destination -RootPath $entry.RootPath) {
+            throw 'A quarantined item cannot be restored inside its quarantine root.'
+        }
+        if (Test-Path -LiteralPath $destination) {
+            throw "Restore destination already exists: $destination"
+        }
+        if ($item.IsContainer -and
+            -not ([System.IO.Path]::GetPathRoot($entry.PayloadPath)).Equals([System.IO.Path]::GetPathRoot($destination), [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw 'A quarantined directory must be restored to the same volume.'
+        }
+
+        $destinationParent = [System.IO.Path]::GetDirectoryName($destination)
+        if ([string]::IsNullOrWhiteSpace($destinationParent)) {
+            throw 'Restore destination has no parent directory.'
+        }
+        if (-not $PSCmdlet.ShouldProcess($destination, "Restore quarantine item $Id")) {
+            return [PSCustomObject]@{Success = $true; Simulated = $true; Id = $Id; DestinationPath = $destination; Error = $null }
+        }
+
+        $null = [System.IO.Directory]::CreateDirectory($destinationParent)
+        Move-Item -LiteralPath $entry.PayloadPath -Destination $destination -ErrorAction Stop
+        $warning = $null
+        try { Invoke-PathForgeTreeRemovalNoFollow -Path $entry.EntryPath }
+        catch { $warning = "Item was restored, but its empty quarantine record could not be removed: $($_.Exception.Message)" }
+
+        return [PSCustomObject]@{Success = $true; Simulated = $false; Id = $Id; DestinationPath = $destination; Warning = $warning; Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Id = $Id; DestinationPath = $DestinationPath; Error = $_.Exception.Message }
+    }
+}
+
+function Remove-PathForgeQuarantineItem {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [string[]]$RootPath
+    )
+
+    try {
+        $entry = if ($PSBoundParameters.ContainsKey('RootPath')) {
+            Resolve-PathForgeQuarantineEntry -Id $Id -RootPath $RootPath
+        }
+        else {
+            Resolve-PathForgeQuarantineEntry -Id $Id
+        }
+        if (-not $PSCmdlet.ShouldProcess($entry.EntryPath, "Permanently purge quarantine item $Id")) {
+            return [PSCustomObject]@{Success = $true; Simulated = $true; Id = $Id; RootPath = $entry.RootPath; Error = $null }
+        }
+
+        Invoke-PathForgeTreeRemovalNoFollow -Path $entry.EntryPath
+        return [PSCustomObject]@{Success = $true; Simulated = $false; Id = $Id; RootPath = $entry.RootPath; Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Id = $Id; RootPath = $RootPath; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-PathForgeQuarantineMaintenance {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [string[]]$RootPath,
+        [ValidateRange(1, 3650)][int]$RetentionDays,
+        [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow,
+        [string]$ConfigPath
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('RetentionDays')) {
+        $policy = Get-PathForgeQuarantinePolicy -ConfigPath $ConfigPath
+        if (-not $policy.Success) {
+            return [PSCustomObject]@{
+                Success = $false; RetentionDays = $policy.RetentionDays; Scanned = 0; Purged = 0
+                Simulated = 0; Failed = 0; Invalid = 0; Errors = @("Quarantine policy is invalid: $($policy.Error)")
+            }
+        }
+        $RetentionDays = $policy.RetentionDays
+    }
+    $items = if ($PSBoundParameters.ContainsKey('RootPath')) {
+        @(Get-PathForgeQuarantineItem -RootPath $RootPath -RetentionDays $RetentionDays -ConfigPath $ConfigPath)
+    }
+    else {
+        @(Get-PathForgeQuarantineItem -RetentionDays $RetentionDays -ConfigPath $ConfigPath)
+    }
+
+    $purged = 0
+    $simulated = 0
+    $failed = 0
+    $invalid = 0
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($item in $items) {
+        if (-not $item.Valid) {
+            $invalid++
+            continue
+        }
+        if ($item.Status -ne 'Quarantined') { continue }
+        if ($item.PurgeAfterUtc -gt $Now) { continue }
+
+        if (-not $PSCmdlet.ShouldProcess($item.EntryPath, "Auto-purge quarantine item $($item.Id)")) {
+            $simulated++
+            continue
+        }
+        $result = Remove-PathForgeQuarantineItem -Id $item.Id -RootPath $item.RootPath -Confirm:$false
+        if ($result.Success) {
+            $purged++
+        }
+        else {
+            $failed++
+            $errors.Add("$($item.Id): $($result.Error)")
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success       = $failed -eq 0
+        RetentionDays = $RetentionDays
+        Scanned       = $items.Count
+        Purged        = $purged
+        Simulated     = $simulated
+        Failed        = $failed
+        Invalid       = $invalid
+        Errors        = $errors.ToArray()
+    }
+}
+
 function Register-BootTimeDelete {
     [CmdletBinding(SupportsShouldProcess)]
     param([string]$Path)
@@ -1324,6 +2041,8 @@ function Resolve-PathForgeDeletionMethod {
         cim           = 'WMI'
         recyclebin    = 'RecycleBin'
         recycle       = 'RecycleBin'
+        quarantine    = 'Quarantine'
+        quarantinezone = 'Quarantine'
         boottime      = 'BootTime'
         boot          = 'BootTime'
         reparsepoint  = 'ReparsePoint'
@@ -1332,7 +2051,7 @@ function Resolve-PathForgeDeletionMethod {
     }
 
     if (-not $aliases.ContainsKey($key)) {
-        throw "Unsupported deletion method '$Method'. Use Auto, Standard, DotNet, LongPath, ShortName, Robocopy, WMI, RecycleBin, BootTime, or ReparsePoint."
+        throw "Unsupported deletion method '$Method'. Use Auto, Standard, DotNet, LongPath, ShortName, Robocopy, WMI, RecycleBin, Quarantine, BootTime, or ReparsePoint."
     }
     return $aliases[$key]
 }
@@ -1420,7 +2139,7 @@ function Invoke-PathForgeDeletionMethod {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)]
-        [ValidateSet('Auto', 'Standard', 'DotNet', 'LongPath', 'ShortName', 'Robocopy', 'WMI', 'RecycleBin', 'BootTime', 'ReparsePoint')]
+        [ValidateSet('Auto', 'Standard', 'DotNet', 'LongPath', 'ShortName', 'Robocopy', 'WMI', 'RecycleBin', 'Quarantine', 'BootTime', 'ReparsePoint')]
         [string]$Method,
         [switch]$IncludeRecycleBin
     )
@@ -1445,6 +2164,7 @@ function Invoke-PathForgeDeletionMethod {
         Robocopy     = 'Remove-ItemRobocopy'
         WMI          = 'Remove-ItemWMI'
         RecycleBin   = 'Move-ToRecycleBin'
+        Quarantine   = 'Move-PathForgeToQuarantine'
         BootTime     = 'Register-BootTimeDelete'
         ReparsePoint = 'Remove-ReparsePointSafe'
     }
@@ -1950,6 +2670,14 @@ Export-ModuleMember -Function @(
     'Find-PathForgeReparsePoint',
     'Remove-PathForgeLinkSafe',
     'Remove-ReparsePointSafe',
+    'Get-PathForgeQuarantineRoot',
+    'Get-PathForgeQuarantinePolicy',
+    'Set-PathForgeQuarantinePolicy',
+    'Get-PathForgeQuarantineItem',
+    'Move-PathForgeToQuarantine',
+    'Restore-PathForgeQuarantineItem',
+    'Remove-PathForgeQuarantineItem',
+    'Invoke-PathForgeQuarantineMaintenance',
     'Register-BootTimeDelete',
     'Get-PathForgePendingFileQueue',
     'Add-PathForgePendingFileDelete',

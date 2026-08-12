@@ -20,6 +20,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 - **Scheduled Queue Editor** — Review delete/move pairs and cancel selected next-boot operations without clearing unrelated entries
 - **Link Inspector** — Identify junctions, symbolic links, hard-link sibling names, native reparse tags, and targets
 - **Reparse Explorer** — Scan trees without descending into links, inspect results, and export a CSV report
+- **Quarantine Zone** — Move files and folders into recoverable same-volume storage, restore them, or purge them after a configurable retention period
 - **Take Ownership** — Seize control of protected system files with one click
 - **Permission Reset** — Restore inheritance and remove explicit deny entries
 - **Orphaned SID Cleanup** — Identify and remove permissions for deleted accounts
@@ -126,7 +127,13 @@ C:\Temp\locked-folder,Robocopy,false
 C:\Temp\remove-at-boot.sys,BootTime,false
 ```
 
-Text files use `path|method|dry-run`; method and dry-run are optional. Supported methods are `Auto`, `Standard`, `DotNet`, `LongPath`, `ShortName`, `Robocopy`, `WMI`, `RecycleBin`, `BootTime`, and `ReparsePoint`. PathForge previews every row and asks once before processing any mutating row.
+Text files use `path|method|dry-run`; method and dry-run are optional. Supported methods are `Auto`, `Standard`, `DotNet`, `LongPath`, `ShortName`, `Robocopy`, `WMI`, `RecycleBin`, `Quarantine`, `BootTime`, and `ReparsePoint`. PathForge previews every row and asks once before processing any mutating row.
+
+### Quarantine Zone
+
+Open **Quarantine Zone** from File Operations to move the current target into recovery storage, restore a selected item to its original path, permanently purge selected entries, or change the retention period (30 days by default). PathForge runs retention maintenance when the application opens; an invalid policy or manifest fails closed and is never auto-purged.
+
+Each local or mapped volume uses its own hidden `PathForge.Quarantine` directory so folder quarantine is a same-volume move instead of a recursive copy. Every item has an atomic JSON recovery manifest. Purge walks the quarantined tree without following nested junctions or symbolic links, and restore refuses to overwrite an existing destination. Top-level reparse points remain under Link Inspector rather than quarantine.
 
 ### Link Safety
 

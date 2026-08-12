@@ -2284,6 +2284,365 @@ function Show-ReparsePointExplorer {
     $dialog.Dispose()
 }
 
+function Invoke-QuarantinePath {
+    param(
+        [string]$Path,
+        [switch]$DryRun
+    )
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Quarantine rejected: $($check.Reason)" -Type "Error"
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Error = $check.Reason }
+    }
+
+    if ($DryRun) {
+        $preview = Move-PathForgeToQuarantine -Path $Path -WhatIf
+        if ($preview.Success) {
+            Write-Console "[DRY-RUN] Would move to quarantine: $Path" -Type "Info"
+            Write-Console "  Storage: $($preview.RootPath)" -Type "Normal"
+            Write-Console "  Purge after: $($preview.PurgeAfterUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))" -Type "Normal"
+        }
+        else {
+            Write-Console "Quarantine preview failed: $($preview.Error)" -Type "Error"
+        }
+        return $preview
+    }
+
+    $confirmation = [System.Windows.Forms.MessageBox]::Show(
+        "Move this path into the PathForge quarantine zone?`n`n$Path`n`nThe item can be restored until its retention period expires.",
+        "Quarantine Path",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning)
+    if ($confirmation -ne [System.Windows.Forms.DialogResult]::Yes) {
+        Write-Console "Quarantine cancelled" -Type "Warning"
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Cancelled = $true; Error = $null }
+    }
+
+    Set-Status "Moving path to quarantine..."
+    $result = Move-PathForgeToQuarantine -Path $Path -Confirm:$false
+    if ($result.Success) {
+        Write-Console "Moved to quarantine: $Path" -Type "Success"
+        Write-Console "  Item ID: $($result.Id)" -Type "Normal"
+        Write-Console "  Auto-purge: $($result.PurgeAfterUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))" -Type "Normal"
+        if ($result.Warning) {
+            Write-Console $result.Warning -Type "Warning"
+        }
+        Write-Log "Quarantined path: $Path id=$($result.Id)" -Level "SUCCESS"
+    }
+    else {
+        Write-Console "Quarantine failed: $($result.Error)" -Type "Error"
+        Write-Log "Quarantine failed: $Path - $($result.Error)" -Level "ERROR"
+    }
+    Set-Status "Ready"
+    return $result
+}
+
+function Invoke-QuarantineStartupMaintenance {
+    $result = Invoke-PathForgeQuarantineMaintenance -Confirm:$false
+    if (-not $result.Success) {
+        foreach ($maintenanceError in @($result.Errors)) {
+            Write-Log "Quarantine maintenance failed: $maintenanceError" -Level "ERROR"
+        }
+        Write-Console "Quarantine maintenance needs attention; open Quarantine Zone for details" -Type "Warning"
+        return $result
+    }
+
+    if ($result.Purged -gt 0) {
+        Write-Console "Quarantine maintenance permanently purged $($result.Purged) expired item(s)" -Type "Info"
+        Write-Log "Quarantine auto-purge removed $($result.Purged) expired item(s)" -Level "INFO"
+    }
+    if ($result.Invalid -gt 0) {
+        Write-Console "Quarantine contains $($result.Invalid) invalid record(s); automatic purge skipped them" -Type "Warning"
+    }
+    return $result
+}
+
+function Show-QuarantineManager {
+    param([string]$InitialPath)
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "PathForge Quarantine Zone"
+    $dialog.Size = New-Object System.Drawing.Size(1120, 650)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(980, 560)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.Add_HandleCreated({ try { [DarkMode]::EnableDarkTitleBar($this.Handle) } catch { Write-Verbose "Quarantine title-bar theming failed: $_" } })
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "Quarantine Zone"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $Script:Theme.TextPrimary
+    $title.Location = New-Object System.Drawing.Point(20, 15)
+    $title.AutoSize = $true
+    $null = $dialog.Controls.Add($title)
+
+    $description = New-Object System.Windows.Forms.Label
+    $description.Text = "Items move to same-volume recovery storage and are permanently purged after the retention period."
+    $description.ForeColor = $Script:Theme.TextMuted
+    $description.Location = New-Object System.Drawing.Point(22, 48)
+    $description.Size = New-Object System.Drawing.Size(750, 22)
+    $null = $dialog.Controls.Add($description)
+
+    $retentionLabel = New-Object System.Windows.Forms.Label
+    $retentionLabel.Text = "Retention (days)"
+    $retentionLabel.ForeColor = $Script:Theme.TextSecondary
+    $retentionLabel.Location = New-Object System.Drawing.Point(790, 20)
+    $retentionLabel.Size = New-Object System.Drawing.Size(100, 22)
+    $null = $dialog.Controls.Add($retentionLabel)
+
+    $retentionInput = New-Object System.Windows.Forms.NumericUpDown
+    $retentionInput.Name = "QuarantineRetentionDays"
+    $retentionInput.AccessibleName = "Quarantine retention in days"
+    $retentionInput.Minimum = 1
+    $retentionInput.Maximum = 3650
+    $retentionInput.Value = 30
+    $retentionInput.Location = New-Object System.Drawing.Point(895, 17)
+    $retentionInput.Size = New-Object System.Drawing.Size(70, 24)
+    $retentionInput.BackColor = $Script:Theme.BgInput
+    $retentionInput.ForeColor = $Script:Theme.TextPrimary
+    $null = $dialog.Controls.Add($retentionInput)
+
+    $savePolicyButton = New-Object System.Windows.Forms.Button
+    $savePolicyButton.Text = "Save Policy"
+    $savePolicyButton.AccessibleName = "Save quarantine retention policy"
+    $savePolicyButton.Location = New-Object System.Drawing.Point(975, 16)
+    $savePolicyButton.Size = New-Object System.Drawing.Size(105, 27)
+    $savePolicyButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $savePolicyButton.BackColor = $Script:Theme.AccentDim
+    $savePolicyButton.ForeColor = $Script:Theme.TextPrimary
+    $savePolicyButton.FlatAppearance.BorderSize = 0
+    $null = $dialog.Controls.Add($savePolicyButton)
+
+    $currentPathLabel = New-Object System.Windows.Forms.Label
+    $currentPathLabel.Name = "QuarantineCurrentPath"
+    $currentPathLabel.Text = if ([string]::IsNullOrWhiteSpace($InitialPath)) { "Current target: (none)" } else { "Current target: $InitialPath" }
+    $currentPathLabel.ForeColor = $Script:Theme.TextSecondary
+    $currentPathLabel.Location = New-Object System.Drawing.Point(22, 78)
+    $currentPathLabel.Size = New-Object System.Drawing.Size(820, 24)
+    $currentPathLabel.AutoEllipsis = $true
+    $null = $dialog.Controls.Add($currentPathLabel)
+
+    $quarantineButton = New-Object System.Windows.Forms.Button
+    $quarantineButton.Name = "QuarantineCurrentButton"
+    $quarantineButton.Text = "Quarantine Current"
+    $quarantineButton.AccessibleName = "Move the current target path into quarantine"
+    $quarantineButton.Location = New-Object System.Drawing.Point(875, 72)
+    $quarantineButton.Size = New-Object System.Drawing.Size(205, 32)
+    $quarantineButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $quarantineButton.BackColor = $Script:Theme.Warning
+    $quarantineButton.ForeColor = [System.Drawing.Color]::Black
+    $quarantineButton.FlatAppearance.BorderSize = 0
+    $quarantineButton.Enabled = -not [string]::IsNullOrWhiteSpace($InitialPath)
+    $null = $dialog.Controls.Add($quarantineButton)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "QuarantineGrid"
+    $grid.AccessibleName = "Quarantined files and folders"
+    $grid.Location = New-Object System.Drawing.Point(20, 115)
+    $grid.Size = New-Object System.Drawing.Size(1060, 390)
+    $grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $grid.BackgroundColor = $Script:Theme.BgInput
+    $grid.ForeColor = $Script:Theme.TextPrimary
+    $grid.GridColor = $Script:Theme.Border
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $grid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $grid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $grid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $grid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.MultiSelect = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.RowHeadersVisible = $false
+    foreach ($columnDefinition in @(
+            @{Name = 'Name'; Header = 'Name'; Width = 145 },
+            @{Name = 'Type'; Header = 'Type'; Width = 70 },
+            @{Name = 'OriginalPath'; Header = 'Original path'; Width = 330 },
+            @{Name = 'Quarantined'; Header = 'Quarantined'; Width = 130 },
+            @{Name = 'PurgeAfter'; Header = 'Purge after'; Width = 130 },
+            @{Name = 'Status'; Header = 'Status'; Width = 105 },
+            @{Name = 'Volume'; Header = 'Storage root'; Width = 170 })) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.Name = $columnDefinition.Name
+        $column.HeaderText = $columnDefinition.Header
+        $column.Width = $columnDefinition.Width
+        $null = $grid.Columns.Add($column)
+    }
+    $null = $dialog.Controls.Add($grid)
+
+    $summaryLabel = New-Object System.Windows.Forms.Label
+    $summaryLabel.Name = "QuarantineSummary"
+    $summaryLabel.ForeColor = $Script:Theme.TextMuted
+    $summaryLabel.Location = New-Object System.Drawing.Point(22, 515)
+    $summaryLabel.Size = New-Object System.Drawing.Size(760, 22)
+    $summaryLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $null = $dialog.Controls.Add($summaryLabel)
+
+    $buttonY = 548
+    $refreshButton = New-Object System.Windows.Forms.Button
+    $refreshButton.Text = "Refresh"
+    $refreshButton.Location = New-Object System.Drawing.Point(20, $buttonY)
+    $refreshButton.Size = New-Object System.Drawing.Size(90, 32)
+
+    $restoreButton = New-Object System.Windows.Forms.Button
+    $restoreButton.Text = "Restore Selected"
+    $restoreButton.AccessibleName = "Restore selected quarantine item"
+    $restoreButton.Location = New-Object System.Drawing.Point(120, $buttonY)
+    $restoreButton.Size = New-Object System.Drawing.Size(145, 32)
+
+    $purgeButton = New-Object System.Windows.Forms.Button
+    $purgeButton.Text = "Purge Selected"
+    $purgeButton.AccessibleName = "Permanently purge selected quarantine item"
+    $purgeButton.Location = New-Object System.Drawing.Point(275, $buttonY)
+    $purgeButton.Size = New-Object System.Drawing.Size(135, 32)
+
+    $purgeExpiredButton = New-Object System.Windows.Forms.Button
+    $purgeExpiredButton.Text = "Purge Expired"
+    $purgeExpiredButton.AccessibleName = "Permanently purge all expired quarantine items"
+    $purgeExpiredButton.Location = New-Object System.Drawing.Point(420, $buttonY)
+    $purgeExpiredButton.Size = New-Object System.Drawing.Size(125, 32)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $closeButton.Location = New-Object System.Drawing.Point(990, $buttonY)
+    $closeButton.Size = New-Object System.Drawing.Size(90, 32)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+
+    foreach ($button in @($refreshButton, $restoreButton, $purgeButton, $purgeExpiredButton, $closeButton)) {
+        $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $button.BackColor = $Script:Theme.BgTertiary
+        $button.ForeColor = $Script:Theme.TextSecondary
+        $button.FlatAppearance.BorderColor = $Script:Theme.Border
+        $null = $dialog.Controls.Add($button)
+    }
+    $restoreButton.ForeColor = $Script:Theme.Success
+    $purgeButton.ForeColor = $Script:Theme.Error
+    $purgeExpiredButton.ForeColor = $Script:Theme.Warning
+    $dialog.CancelButton = $closeButton
+
+    $refreshItems = {
+        $grid.Rows.Clear()
+        $policy = Get-PathForgeQuarantinePolicy
+        $retentionInput.Value = [decimal]$policy.RetentionDays
+        $items = @(Get-PathForgeQuarantineItem -RetentionDays $policy.RetentionDays)
+        foreach ($item in $items) {
+            $quarantinedText = if ($item.QuarantinedAtUtc) { $item.QuarantinedAtUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm') } else { '-' }
+            $purgeText = if ($item.PurgeAfterUtc) { $item.PurgeAfterUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm') } else { '-' }
+            $typeText = if ($item.IsContainer) { 'Folder' } else { 'File' }
+            $rowIndex = $grid.Rows.Add($item.OriginalName, $typeText, $item.OriginalPath, $quarantinedText, $purgeText, $item.Status, $item.RootPath)
+            $grid.Rows[$rowIndex].Tag = $item
+            if (-not $item.Valid) {
+                $grid.Rows[$rowIndex].DefaultCellStyle.ForeColor = $Script:Theme.Error
+            }
+        }
+        $validCount = @($items | Where-Object Valid).Count
+        $summaryLabel.Text = "$($items.Count) item(s); $validCount recoverable; retention $($policy.RetentionDays) day(s)"
+        if (-not $policy.Success) {
+            $summaryLabel.Text += "; policy error: $($policy.Error)"
+            $summaryLabel.ForeColor = $Script:Theme.Error
+        }
+        else {
+            $summaryLabel.ForeColor = $Script:Theme.TextMuted
+        }
+    }.GetNewClosure()
+
+    $getSelectedItem = {
+        if ($grid.SelectedRows.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show($dialog, "Select a quarantine item first.", "No Selection", 0, 48) | Out-Null
+            return $null
+        }
+        return $grid.SelectedRows[0].Tag
+    }.GetNewClosure()
+
+    $quarantineButton.Add_Click({
+        $result = Invoke-QuarantinePath -Path $InitialPath -DryRun:($Script:DryRunCheck -and $Script:DryRunCheck.Checked)
+        if ($result.Success -and -not $result.Simulated) {
+            $quarantineButton.Enabled = $false
+            $currentPathLabel.Text = "Current target moved to quarantine"
+            & $refreshItems
+        }
+    }.GetNewClosure())
+    $savePolicyButton.Add_Click({
+        $result = Set-PathForgeQuarantinePolicy -RetentionDays ([int]$retentionInput.Value) -Confirm:$false
+        if ($result.Success) {
+            Write-Console "Quarantine retention set to $($result.RetentionDays) day(s)" -Type "Success"
+            Write-Log "Quarantine retention policy updated: $($result.RetentionDays) days" -Level "INFO"
+            & $refreshItems
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $result.Error, "Policy Update Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $refreshButton.Add_Click({ & $refreshItems }.GetNewClosure())
+    $restoreButton.Add_Click({
+        $item = & $getSelectedItem
+        if (-not $item) { return }
+        $confirmation = [System.Windows.Forms.MessageBox]::Show(
+            $dialog,
+            "Restore this item to its original path?`n`n$($item.OriginalPath)",
+            "Restore Quarantine Item", 4, 48)
+        if ($confirmation -ne 6) { return }
+        $result = Restore-PathForgeQuarantineItem -Id $item.Id -RootPath $item.RootPath -Confirm:$false
+        if ($result.Success) {
+            Write-Console "Restored from quarantine: $($result.DestinationPath)" -Type "Success"
+            Write-Log "Restored quarantine item $($item.Id) to $($result.DestinationPath)" -Level "SUCCESS"
+            if ($result.Warning) { Write-Console $result.Warning -Type "Warning" }
+            & $refreshItems
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $result.Error, "Restore Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $purgeButton.Add_Click({
+        $item = & $getSelectedItem
+        if (-not $item) { return }
+        $confirmation = [System.Windows.Forms.MessageBox]::Show(
+            $dialog,
+            "Permanently purge this quarantine item?`n`n$($item.OriginalPath)`n`nThis cannot be undone.",
+            "Permanent Purge", 4, 48)
+        if ($confirmation -ne 6) { return }
+        $result = Remove-PathForgeQuarantineItem -Id $item.Id -RootPath $item.RootPath -Confirm:$false
+        if ($result.Success) {
+            Write-Console "Permanently purged quarantine item: $($item.OriginalPath)" -Type "Success"
+            Write-Log "Purged quarantine item $($item.Id)" -Level "INFO"
+            & $refreshItems
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $result.Error, "Purge Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $purgeExpiredButton.Add_Click({
+        $confirmation = [System.Windows.Forms.MessageBox]::Show(
+            $dialog,
+            "Permanently purge every item past the current retention period?",
+            "Purge Expired Items", 4, 48)
+        if ($confirmation -ne 6) { return }
+        $result = Invoke-PathForgeQuarantineMaintenance -RetentionDays ([int]$retentionInput.Value) -Confirm:$false
+        if ($result.Success) {
+            Write-Console "Quarantine purge complete: $($result.Purged) expired item(s) removed" -Type "Success"
+            & $refreshItems
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show($dialog, ($result.Errors -join [Environment]::NewLine), "Purge Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $dialog.Add_Shown({ & $refreshItems }.GetNewClosure())
+
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) { [void]$dialog.ShowDialog($owner) } else { [void]$dialog.ShowDialog() }
+    $dialog.Dispose()
+}
+
 # ============================================================================
 # ALTERNATE DATA STREAMS
 # ============================================================================
@@ -3608,6 +3967,12 @@ function Build-FileOpsPage {
     }
     $null = $page.Controls.Add($card4c)
     $y += 130
+
+    $quarantineCard = New-ToolCard -Title "Quarantine Zone" -Desc "Move a path into recoverable same-volume storage; restore it or auto-purge after retention" -BtnText "Open Zone" -X 30 -Y $y -OnClick {
+        Show-QuarantineManager -InitialPath $Script:PathTextBox.Text
+    }
+    $null = $page.Controls.Add($quarantineCard)
+    $y += 130
     
     # ========== BOOT DELETE INFO PANEL ==========
     $bootInfo = New-InfoPanel -Key "BootDelete" -X 30 -Y $y -Width 900
@@ -4445,6 +4810,7 @@ function Start-Application {
             $Script:PathTextBox.Text = $InitialPath
             Write-Console "Path pre-filled: $InitialPath" -Type "Info"
         }
+        Invoke-QuarantineStartupMaintenance | Out-Null
     }.GetNewClosure())
 
     [void]$mainForm.ShowDialog()

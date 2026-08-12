@@ -16,6 +16,7 @@ All notable changes to PathForge will be documented in this file.
 - CSV and text deletion batches with per-row method selection, validation, dry-run, and single-confirmation execution
 - Scheduled deletion queue editor with pair-preserving selective cancellation, stale-snapshot protection, and modern queue-prefix display
 - Native junction, symbolic-link, hard-link, and reparse-point inspection with non-traversing tree scans, CSV export, and link-only safe deletion
+- Recoverable same-volume quarantine storage with atomic manifests, restore and manual purge controls, configurable retention, batch support, and startup auto-purge
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation
@@ -25,6 +26,7 @@ All notable changes to PathForge will be documented in this file.
 - Stream DISM, SFC, and CHKDSK output through one testable core runner instead of duplicated GUI handlers
 - Package the GUI script and required core module together in the Scoop manifest
 - Prevent Recycle Bin or generic recursive deletion methods from running against reparse points
+- Keep quarantine purge inside its storage root, never traverse nested links, and fail closed when retention policy or recovery metadata is invalid
 
 ## [v3.1.0] - 2026-06-20
 

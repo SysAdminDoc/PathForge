@@ -1526,20 +1526,16 @@ function Invoke-BootTimeDelete {
         }
         else {
             Write-Console "MoveFileEx API call failed ($($bootDeleteResult.Error)), trying registry fallback..." -Type "Warning"
-            
-            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
-            $existing = @()
-            try {
-                $prop = Get-ItemProperty -Path $regPath -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
-                if ($prop) { $existing = @($prop.PendingFileRenameOperations) }
+
+            $fallbackResult = Add-PathForgePendingFileDelete -Path $Path -Confirm:$false
+            if ($fallbackResult.Success) {
+                Write-Console "Scheduled via registry fallback" -Type "Success"
+                Write-Log "Boot-time deletion scheduled via registry: $Path" -Level "SUCCESS"
+                return $true
             }
-            catch { }
-            
-            $newEntries = $existing + @("\??\$Path", "")
-            Set-ItemProperty -Path $regPath -Name PendingFileRenameOperations -Value $newEntries -Type MultiString -Force
-            
-            Write-Console "Scheduled via registry fallback" -Type "Success"
-            return $true
+
+            Write-Console "Registry fallback failed: $($fallbackResult.Error)" -Type "Error"
+            return $false
         }
     }
     catch {
@@ -1548,63 +1544,289 @@ function Invoke-BootTimeDelete {
     }
 }
 
-function Get-PendingDeletions {
-    Write-Console "=== Pending Boot-Time Operations ===" -Type "Info"
-    Write-Console "Registry: HKLM\...\Session Manager\PendingFileRenameOperations" -Type "Normal"
-    Write-Console "" -Type "Normal"
-    
-    try {
-        $prop = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
-        
-        if ($prop -and $prop.PendingFileRenameOperations) {
-            $ops = $prop.PendingFileRenameOperations
-            $deleteCount = 0
-            $moveCount = 0
-            
-            for ($i = 0; $i -lt $ops.Count; $i += 2) {
-                $source = $ops[$i] -replace '^\\\?\?\\', ''
-                $dest = if ($i + 1 -lt $ops.Count) { $ops[$i + 1] } else { "" }
-                
-                if (-not $dest -or $dest -eq "") {
-                    Write-Console "  DELETE: $source" -Type "Warning"
-                    $deleteCount++
-                }
-                else {
-                    $dest = $dest -replace '^\\\?\?\\', ''
-                    Write-Console "  MOVE: $source" -Type "Info"
-                    Write-Console "     -> $dest" -Type "Normal"
-                    $moveCount++
-                }
-            }
-            
-            Write-Console "" -Type "Normal"
-            Write-Console "Total: $deleteCount deletion(s), $moveCount move(s) pending" -Type "Info"
-        }
-        else {
-            Write-Console "No pending boot-time operations" -Type "Success"
-        }
-    }
-    catch {
-        Write-Console "Error reading pending operations: $_" -Type "Error"
-    }
-}
+function Show-PendingDeletionQueue {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$QueueProvider,
+        [scriptblock]$RemoveAction
+    )
 
-function Clear-PendingDeletions {
-    Write-Console "Clearing all pending boot-time operations..." -Type "Warning"
-    
-    $result = [System.Windows.Forms.MessageBox]::Show(
-        "This will cancel ALL pending file operations scheduled for next boot.`n`nAre you sure?",
-        "Confirm Clear", 4, 48)
-    
-    if ($result -eq 6) {
+    if (-not $QueueProvider) {
+        $QueueProvider = { Get-PathForgePendingFileQueue }
+    }
+    if (-not $RemoveAction) {
+        $RemoveAction = {
+            param($Indexes, $SnapshotHash)
+            Remove-PathForgePendingFileOperation -Index $Indexes -ExpectedSnapshotHash $SnapshotHash -Confirm:$false
+        }
+    }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Scheduled Deletion Queue"
+    $dialog.Size = New-Object System.Drawing.Size(920, 560)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(760, 460)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.ShowIcon = $false
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = "Pending reboot file operations"
+    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 15)
+    $titleLabel.ForeColor = $Script:Theme.TextPrimary
+    $titleLabel.AutoSize = $true
+    $titleLabel.Location = New-Object System.Drawing.Point(20, 18)
+    $null = $dialog.Controls.Add($titleLabel)
+
+    $helpLabel = New-Object System.Windows.Forms.Label
+    $helpLabel.Text = "Select rows with Ctrl/Shift-click. Cancelling rewrites only the selected source/destination pairs."
+    $helpLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $helpLabel.ForeColor = $Script:Theme.TextMuted
+    $helpLabel.AutoSize = $true
+    $helpLabel.Location = New-Object System.Drawing.Point(22, 50)
+    $null = $dialog.Controls.Add($helpLabel)
+
+    $summaryLabel = New-Object System.Windows.Forms.Label
+    $summaryLabel.Text = "Loading queue..."
+    $summaryLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $summaryLabel.ForeColor = $Script:Theme.Info
+    $summaryLabel.AutoSize = $true
+    $summaryLabel.Location = New-Object System.Drawing.Point(22, 76)
+    $null = $dialog.Controls.Add($summaryLabel)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "PendingQueueGrid"
+    $grid.AccessibleName = "Pending reboot file operations"
+    $grid.Location = New-Object System.Drawing.Point(20, 104)
+    $grid.Size = New-Object System.Drawing.Size(862, 348)
+    $grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $grid.BackgroundColor = $Script:Theme.BgInput
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $grid.GridColor = $Script:Theme.Border
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $Script:Theme.BgTertiary
+    $grid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $grid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $grid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $grid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $grid.RowHeadersVisible = $false
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.ReadOnly = $true
+    $grid.MultiSelect = $true
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.AutoGenerateColumns = $false
+
+    $indexColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $indexColumn.Name = "QueueIndex"
+    $indexColumn.HeaderText = "#"
+    $indexColumn.Width = 42
+    $indexColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $null = $grid.Columns.Add($indexColumn)
+
+    $kindColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $kindColumn.Name = "OperationKind"
+    $kindColumn.HeaderText = "Operation"
+    $kindColumn.Width = 105
+    $kindColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $null = $grid.Columns.Add($kindColumn)
+
+    $sourceColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $sourceColumn.Name = "SourcePath"
+    $sourceColumn.HeaderText = "Source"
+    $sourceColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    $sourceColumn.FillWeight = 55
+    $sourceColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $null = $grid.Columns.Add($sourceColumn)
+
+    $destinationColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $destinationColumn.Name = "DestinationPath"
+    $destinationColumn.HeaderText = "Destination"
+    $destinationColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    $destinationColumn.FillWeight = 45
+    $destinationColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $null = $grid.Columns.Add($destinationColumn)
+    $null = $dialog.Controls.Add($grid)
+
+    $refreshButton = New-Object System.Windows.Forms.Button
+    $refreshButton.Text = "Refresh"
+    $refreshButton.AccessibleName = "Refresh pending reboot queue"
+    $refreshButton.Location = New-Object System.Drawing.Point(20, 468)
+    $refreshButton.Size = New-Object System.Drawing.Size(90, 34)
+    $refreshButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+    $refreshButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $refreshButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $refreshButton.BackColor = $Script:Theme.BgTertiary
+    $refreshButton.ForeColor = $Script:Theme.TextSecondary
+    $null = $dialog.Controls.Add($refreshButton)
+
+    $cancelSelectedButton = New-Object System.Windows.Forms.Button
+    $cancelSelectedButton.Text = "Cancel Selected"
+    $cancelSelectedButton.AccessibleName = "Cancel selected pending operations"
+    $cancelSelectedButton.Location = New-Object System.Drawing.Point(522, 468)
+    $cancelSelectedButton.Size = New-Object System.Drawing.Size(125, 34)
+    $cancelSelectedButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $cancelSelectedButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $cancelSelectedButton.FlatAppearance.BorderColor = $Script:Theme.Warning
+    $cancelSelectedButton.BackColor = $Script:Theme.BgTertiary
+    $cancelSelectedButton.ForeColor = $Script:Theme.Warning
+    $cancelSelectedButton.Enabled = $false
+    $null = $dialog.Controls.Add($cancelSelectedButton)
+
+    $clearAllButton = New-Object System.Windows.Forms.Button
+    $clearAllButton.Text = "Clear All"
+    $clearAllButton.AccessibleName = "Cancel all pending operations"
+    $clearAllButton.Location = New-Object System.Drawing.Point(655, 468)
+    $clearAllButton.Size = New-Object System.Drawing.Size(100, 34)
+    $clearAllButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $clearAllButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $clearAllButton.FlatAppearance.BorderColor = $Script:Theme.Error
+    $clearAllButton.BackColor = $Script:Theme.BgTertiary
+    $clearAllButton.ForeColor = $Script:Theme.Error
+    $clearAllButton.Enabled = $false
+    $null = $dialog.Controls.Add($clearAllButton)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.AccessibleName = "Close scheduled deletion queue"
+    $closeButton.Location = New-Object System.Drawing.Point(763, 468)
+    $closeButton.Size = New-Object System.Drawing.Size(119, 34)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $closeButton.BackColor = $Script:Theme.AccentDim
+    $closeButton.ForeColor = $Script:Theme.TextPrimary
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.CancelButton = $closeButton
+    $null = $dialog.Controls.Add($closeButton)
+
+    $queueInfoColor = $Script:Theme.Info
+    $queueWarningColor = $Script:Theme.Warning
+    $queueErrorColor = $Script:Theme.Error
+
+    $loadQueue = {
+        $grid.Rows.Clear()
         try {
-            Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager" -Name PendingFileRenameOperations -ErrorAction Stop
-            Write-Console "All pending operations cleared" -Type "Success"
+            $queue = & $QueueProvider
         }
         catch {
-            Write-Console "Failed to clear (may already be empty): $_" -Type "Warning"
+            $queue = [PSCustomObject]@{Success = $false; Operations = @(); Error = $_.Exception.Message }
         }
+        $dialog.Tag = $queue
+
+        if (-not $queue.Success) {
+            $summaryLabel.Text = "Unable to read the queue: $($queue.Error)"
+            $summaryLabel.ForeColor = $queueErrorColor
+            $cancelSelectedButton.Enabled = $false
+            $clearAllButton.Enabled = $false
+            return
+        }
+
+        try {
+            foreach ($operation in @($queue.Operations)) {
+                $kindText = if ($operation.ReplaceExisting) { "Move/Replace" } else { [string]$operation.Kind }
+                $queuePrefixes = @($operation.SourcePrefix, $operation.DestinationPrefix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+                if ($queuePrefixes.Count -gt 0) {
+                    $kindText = "$kindText [$($queuePrefixes -join '/')]"
+                }
+                $destinationText = switch ($operation.Kind) {
+                    'Delete' { "(delete on reboot)" }
+                    'Malformed' { "(missing or invalid pair)" }
+                    default { [string]$operation.Destination }
+                }
+                $rowIndex = $grid.Rows.Add($operation.Index, $kindText, $operation.Source, $destinationText)
+                if ($operation.IsMalformed) {
+                    $grid.Rows[$rowIndex].DefaultCellStyle.ForeColor = $queueErrorColor
+                }
+                elseif ($operation.Kind -eq 'Delete') {
+                    $grid.Rows[$rowIndex].DefaultCellStyle.ForeColor = $queueWarningColor
+                }
+            }
+
+            $summaryLabel.Text = "$($queue.Operations.Count) operation(s): $($queue.DeleteCount) delete, $($queue.MoveCount) move, $($queue.MalformedCount) malformed"
+            $summaryLabel.ForeColor = if ($queue.MalformedCount -gt 0) { $queueWarningColor } else { $queueInfoColor }
+            $clearAllButton.Enabled = $queue.Operations.Count -gt 0
+            if ($grid.Rows.Count -gt 0) {
+                $grid.ClearSelection()
+            }
+            $cancelSelectedButton.Enabled = $grid.SelectedRows.Count -gt 0
+        }
+        catch {
+            $summaryLabel.Text = "Unable to render the queue: $($_.Exception.Message)"
+            $summaryLabel.ForeColor = $queueErrorColor
+            $cancelSelectedButton.Enabled = $false
+            $clearAllButton.Enabled = $false
+        }
+    }.GetNewClosure()
+
+    $cancelOperations = {
+        param([int[]]$Indexes, [bool]$AllOperations)
+
+        if (@($Indexes).Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show($dialog, "Select at least one queue row first.", "Nothing Selected", 0, 48) | Out-Null
+            return
+        }
+
+        $scopeText = if ($AllOperations) { "ALL $($Indexes.Count) pending operations" } else { "$($Indexes.Count) selected operation(s)" }
+        $confirmation = [System.Windows.Forms.MessageBox]::Show(
+            $dialog,
+            "Cancel $scopeText?`n`nThis changes Windows' next-boot file operation queue immediately.",
+            "Confirm Queue Edit",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($confirmation -ne [System.Windows.Forms.DialogResult]::Yes) {
+            return
+        }
+
+        $currentQueue = $dialog.Tag
+        try {
+            $result = & $RemoveAction $Indexes $currentQueue.SnapshotHash
+        }
+        catch {
+            $result = [PSCustomObject]@{Success = $false; Conflict = $false; Error = $_.Exception.Message }
+        }
+
+        if ($result.Success) {
+            Write-Console "Cancelled $($result.RemovedCount) pending reboot operation(s)" -Type "Success"
+            Write-Log "Pending reboot queue edited: removed=$($result.RemovedCount) remaining=$($result.RemainingCount)" -Level "SUCCESS"
+            & $loadQueue
+            return
+        }
+
+        $errorTitle = if ($result.Conflict) { "Queue Changed" } else { "Queue Edit Failed" }
+        [System.Windows.Forms.MessageBox]::Show($dialog, $result.Error, $errorTitle, 0, 16) | Out-Null
+        & $loadQueue
+    }.GetNewClosure()
+
+    $refreshButton.Add_Click({ & $loadQueue }.GetNewClosure())
+    $grid.Add_SelectionChanged({
+        $cancelSelectedButton.Enabled = $grid.SelectedRows.Count -gt 0
+    }.GetNewClosure())
+    $cancelSelectedButton.Add_Click({
+        $selectedIndexes = @($grid.SelectedRows | ForEach-Object { [int]$_.Cells['QueueIndex'].Value })
+        & $cancelOperations $selectedIndexes $false
+    }.GetNewClosure())
+    $clearAllButton.Add_Click({
+        $allIndexes = @($dialog.Tag.Operations | ForEach-Object Index)
+        & $cancelOperations $allIndexes $true
+    }.GetNewClosure())
+    $dialog.Add_Shown({ & $loadQueue }.GetNewClosure())
+
+    Write-Console "Opening scheduled deletion queue editor" -Type "Info"
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) {
+        [void]$dialog.ShowDialog($owner)
     }
+    else {
+        [void]$dialog.ShowDialog()
+    }
+    $dialog.Dispose()
 }
 
 # ============================================================================
@@ -2906,9 +3128,7 @@ function Build-FileOpsPage {
     }
     $null = $page.Controls.Add($card2)
     
-    $card3 = New-ToolCard -Title "View/Clear Pending" -Desc "Shows PendingFileRenameOperations scheduled for next reboot" -BtnText "View List" -X 610 -Y $y -OnClick { 
-        Get-PendingDeletions 
-    }
+    $card3 = New-ToolCard -Title "Pending Queue" -Desc "Review, select, and cancel PendingFileRenameOperations entries safely" -BtnText "Open Queue" -X 610 -Y $y -OnClick { Show-PendingDeletionQueue }
     $null = $page.Controls.Add($card3)
     $y += 130
 

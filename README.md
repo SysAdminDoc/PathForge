@@ -17,6 +17,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 - **Six Deletion Methods** — Progressive escalation from PowerShell to WMI, including long path and 8.3 short name techniques
 - **Lock-Holder Identification** — Uses Windows Restart Manager to report the process and PID holding a target open before deletion
 - **Boot-Time Deletion** — Schedule stubborn files for removal on next restart via MoveFileEx API
+- **Scheduled Queue Editor** — Review delete/move pairs and cancel selected next-boot operations without clearing unrelated entries
 - **Take Ownership** — Seize control of protected system files with one click
 - **Permission Reset** — Restore inheritance and remove explicit deny entries
 - **Orphaned SID Cleanup** — Identify and remove permissions for deleted accounts
@@ -107,6 +108,8 @@ PathForge offers six deletion methods in order of escalation:
 | **WMI** | Last resort before boot-time deletion |
 
 If all methods fail, use **Schedule Boot-Time Deletion** — the file will be removed before Windows fully loads.
+
+Use **Pending Queue** to inspect the raw next-boot operation pairs. PathForge preserves Windows queue prefixes and unselected entries exactly, and refuses a cancellation if another process changed the queue after it was loaded.
 
 Enable **Dry-run only** to inventory the target, preview a bounded sample, and see which deletion API would run at each escalation step without changing files, ownership, links, the Recycle Bin, or the reboot queue.
 

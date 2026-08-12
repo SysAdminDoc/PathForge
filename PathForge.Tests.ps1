@@ -32,7 +32,8 @@ Describe "PathForge.Core module boundary" {
     It "loads reusable operations from the core module" {
         foreach ($commandName in @(
                 'Test-SafePath', 'Remove-ItemStandard', 'Get-DriveSmartHealth',
-                'Get-PathForgeRepairCommand', 'Get-PathForgeDriveHealth')) {
+                'Get-PathForgeRepairCommand', 'Get-PathForgeDriveHealth',
+                'Get-PathForgePendingFileQueue', 'Remove-PathForgePendingFileOperation')) {
             (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
         }
     }
@@ -234,6 +235,82 @@ Describe "PathForge.Core module boundary" {
         Test-Path -LiteralPath $previewTarget | Should -BeTrue
         $live.Success | Should -BeTrue
         Test-Path -LiteralPath $liveTarget | Should -BeFalse
+    }
+
+    It "parses pending delete, move, replace, and malformed queue entries" {
+        $rawValue = @(
+            '*1\??\C:\Temp\delete.txt', '',
+            '\??\C:\Temp\old.txt', '!\??\C:\Temp\new.txt',
+            '\??\C:\Temp\orphan.txt'
+        )
+
+        $queue = Get-PathForgePendingFileQueue -RegistryValue $rawValue
+
+        $queue.Success | Should -BeTrue
+        $queue.DeleteCount | Should -Be 1
+        $queue.MoveCount | Should -Be 1
+        $queue.MalformedCount | Should -Be 1
+        $queue.Operations[0].Source | Should -Be 'C:\Temp\delete.txt'
+        $queue.Operations[0].SourcePrefix | Should -Be '*1'
+        $queue.Operations[1].Destination | Should -Be 'C:\Temp\new.txt'
+        $queue.Operations[1].ReplaceExisting | Should -BeTrue
+        $queue.Operations[2].HasDestination | Should -BeFalse
+        $queue.SnapshotHash | Should -Match '^[A-F0-9]{64}$'
+    }
+
+    It "removes only selected raw queue pairs and preserves their order" {
+        Mock Read-PathForgePendingFileRegistryValue -ModuleName PathForge.Core {
+            [PSCustomObject]@{
+                Success = $true
+                Exists  = $true
+                Value   = @(
+                    '\??\C:\Temp\delete.txt', '',
+                    '\??\C:\Temp\old.txt', '\??\C:\Temp\new.txt',
+                    '\??\C:\Temp\keep.txt', ''
+                )
+                Error   = $null
+            }
+        }
+        Mock Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core {}
+        $snapshot = (Get-PathForgePendingFileQueue).SnapshotHash
+
+        $result = Remove-PathForgePendingFileOperation -Index 1 -ExpectedSnapshotHash $snapshot -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        $result.RemovedCount | Should -Be 1
+        $result.RemainingCount | Should -Be 2
+        Should -Invoke Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core -Times 1 -ParameterFilter {
+            @($Value).Count -eq 4 -and
+            $Value[0] -eq '\??\C:\Temp\delete.txt' -and $Value[1] -eq '' -and
+            $Value[2] -eq '\??\C:\Temp\keep.txt' -and $Value[3] -eq ''
+        }
+    }
+
+    It "rejects stale queue edits before writing the registry" {
+        Mock Read-PathForgePendingFileRegistryValue -ModuleName PathForge.Core {
+            [PSCustomObject]@{Success = $true; Exists = $true; Value = @('\??\C:\Temp\delete.txt', ''); Error = $null }
+        }
+        Mock Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core {}
+
+        $result = Remove-PathForgePendingFileOperation -Index 0 -ExpectedSnapshotHash ('0' * 64) -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.Conflict | Should -BeTrue
+        $result.Error | Should -Match 'changed after it was loaded'
+        Should -Invoke Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core -Times 0
+    }
+
+    It "supports a non-mutating queue cancellation preview" {
+        Mock Read-PathForgePendingFileRegistryValue -ModuleName PathForge.Core {
+            [PSCustomObject]@{Success = $true; Exists = $true; Value = @('\??\C:\Temp\delete.txt', ''); Error = $null }
+        }
+        Mock Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core {}
+
+        $result = Remove-PathForgePendingFileOperation -Index 0 -WhatIf
+
+        $result.Success | Should -BeTrue
+        $result.Simulated | Should -BeTrue
+        Should -Invoke Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core -Times 0
     }
 }
 
@@ -532,6 +609,36 @@ Describe "Deletion batch GUI" {
 
         $summary.Cancelled | Should -BeTrue
         Test-Path -LiteralPath $target | Should -BeTrue
+    }
+}
+
+Describe "Scheduled deletion queue editor" {
+    It "uses the reusable queue API and exposes selective cancellation controls" {
+        $queueAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-PendingDeletionQueue'
+        }, $true) | Select-Object -First 1
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+
+        $queueAst.Extent.Text | Should -Match 'DataGridView'
+        $queueAst.Extent.Text | Should -Match 'Cancel Selected'
+        $queueAst.Extent.Text | Should -Match 'Clear All'
+        $queueAst.Extent.Text | Should -Match 'SnapshotHash'
+        $fileOpsAst.Extent.Text | Should -Match 'Title "Pending Queue"'
+        $fileOpsAst.Extent.Text | Should -Match 'Show-PendingDeletionQueue'
+    }
+
+    It "routes boot-time registry fallback through the core module" {
+        $bootAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Invoke-BootTimeDelete'
+        }, $true) | Select-Object -First 1
+
+        $bootAst.Extent.Text | Should -Match 'Add-PathForgePendingFileDelete'
+        $bootAst.Extent.Text | Should -Not -Match 'Set-ItemProperty'
     }
 }
 

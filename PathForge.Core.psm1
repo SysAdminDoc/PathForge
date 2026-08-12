@@ -2,6 +2,9 @@
 
 Add-Type -AssemblyName Microsoft.VisualBasic
 
+$Script:PathForgeSessionManagerRegistryPath = 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager'
+$Script:PathForgePendingFileValueName = 'PendingFileRenameOperations'
+
 if (-not ('PathForgeBootDeleteNative' -as [type])) {
     Add-Type -TypeDefinition @"
 using System;
@@ -429,6 +432,259 @@ function Register-BootTimeDelete {
     }
     catch {
         return @{Success = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Read-PathForgePendingFileRegistryValue {
+    try {
+        $registryKey = Get-Item -LiteralPath $Script:PathForgeSessionManagerRegistryPath -ErrorAction Stop
+        if (@($registryKey.GetValueNames()) -notcontains $Script:PathForgePendingFileValueName) {
+            return [PSCustomObject]@{Success = $true; Exists = $false; Value = @(); Error = $null }
+        }
+
+        $value = $registryKey.GetValue(
+            $Script:PathForgePendingFileValueName,
+            $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        return [PSCustomObject]@{Success = $true; Exists = $true; Value = @($value); Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Exists = $false; Value = @(); Error = $_.Exception.Message }
+    }
+}
+
+function Write-PathForgePendingFileRegistryValue {
+    param([AllowEmptyCollection()][string[]]$Value)
+
+    if (@($Value).Count -eq 0) {
+        Remove-ItemProperty -LiteralPath $Script:PathForgeSessionManagerRegistryPath `
+            -Name $Script:PathForgePendingFileValueName -ErrorAction Stop
+        return
+    }
+
+    Set-ItemProperty -LiteralPath $Script:PathForgeSessionManagerRegistryPath `
+        -Name $Script:PathForgePendingFileValueName -Value ([string[]]$Value) `
+        -Type MultiString -Force -ErrorAction Stop
+}
+
+function Get-PathForgePendingFileQueueHash {
+    param([AllowNull()][AllowEmptyCollection()][string[]]$Value)
+
+    $builder = New-Object System.Text.StringBuilder
+    foreach ($entry in @($Value)) {
+        if ($null -eq $entry) {
+            $null = $builder.Append('-1:|')
+        }
+        else {
+            $text = [string]$entry
+            $null = $builder.Append($text.Length).Append(':').Append($text).Append('|')
+        }
+    }
+
+    $algorithm = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($builder.ToString())
+        return [System.BitConverter]::ToString($algorithm.ComputeHash($bytes)).Replace('-', '')
+    }
+    finally {
+        $algorithm.Dispose()
+    }
+}
+
+function ConvertFrom-PathForgeNativeQueuePath {
+    param([AllowNull()][string]$Path)
+
+    if ($null -eq $Path) {
+        return $null
+    }
+
+    $displayPath = $Path
+    if ($displayPath.StartsWith('!', [System.StringComparison]::Ordinal)) {
+        $displayPath = $displayPath.Substring(1)
+    }
+    if ($displayPath -match '^\*[12]') {
+        $displayPath = $displayPath.Substring(2)
+    }
+    if ($displayPath.StartsWith('!', [System.StringComparison]::Ordinal)) {
+        $displayPath = $displayPath.Substring(1)
+    }
+    if ($displayPath.StartsWith('\??\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $displayPath = $displayPath.Substring(4)
+    }
+    elseif ($displayPath.StartsWith('\\?\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $displayPath = $displayPath.Substring(4)
+    }
+    if ($displayPath.StartsWith('UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        $displayPath = '\\' + $displayPath.Substring(4)
+    }
+    return $displayPath
+}
+
+function Get-PathForgePendingFileQueue {
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][string[]]$RegistryValue)
+
+    if ($PSBoundParameters.ContainsKey('RegistryValue')) {
+        $readResult = [PSCustomObject]@{Success = $true; Exists = $true; Value = @($RegistryValue); Error = $null }
+    }
+    else {
+        $readResult = Read-PathForgePendingFileRegistryValue
+    }
+
+    if (-not $readResult.Success) {
+        return [PSCustomObject]@{
+            Success        = $false
+            ValueExists    = $false
+            RawValue       = @()
+            SnapshotHash   = $null
+            Operations     = @()
+            DeleteCount    = 0
+            MoveCount      = 0
+            MalformedCount = 0
+            Error          = $readResult.Error
+        }
+    }
+
+    $rawValue = @($readResult.Value)
+    $snapshotHash = Get-PathForgePendingFileQueueHash -Value $rawValue
+    $operations = New-Object 'System.Collections.Generic.List[object]'
+    for ($rawIndex = 0; $rawIndex -lt $rawValue.Count; $rawIndex += 2) {
+        $operationIndex = [int]($rawIndex / 2)
+        $hasDestination = $rawIndex + 1 -lt $rawValue.Count
+        $rawSource = if ($null -eq $rawValue[$rawIndex]) { '' } else { [string]$rawValue[$rawIndex] }
+        $rawDestination = if ($hasDestination) { $rawValue[$rawIndex + 1] } else { $null }
+        $destinationText = if ($null -eq $rawDestination) { $null } else { [string]$rawDestination }
+        $malformed = -not $hasDestination -or [string]::IsNullOrWhiteSpace($rawSource)
+        $kind = if ($malformed) { 'Malformed' } elseif ([string]::IsNullOrEmpty($destinationText)) { 'Delete' } else { 'Move' }
+        $replaceExisting = -not [string]::IsNullOrEmpty($destinationText) -and $destinationText -match '^(?:\*[12])?!'
+        $sourcePrefix = if ($rawSource -match '^(?:!)?(\*[12])') { $Matches[1] } else { '' }
+        $destinationPrefix = if ($destinationText -match '^(?:!)?(\*[12])') { $Matches[1] } else { '' }
+
+        $operations.Add([PSCustomObject]@{
+                Index             = $operationIndex
+                RawIndex          = $rawIndex
+                Kind              = $kind
+                Source            = ConvertFrom-PathForgeNativeQueuePath -Path $rawSource
+                Destination       = ConvertFrom-PathForgeNativeQueuePath -Path $destinationText
+                ReplaceExisting   = $replaceExisting
+                SourcePrefix      = $sourcePrefix
+                DestinationPrefix = $destinationPrefix
+                IsMalformed       = $malformed
+                HasDestination    = $hasDestination
+                RawSource         = $rawSource
+                RawDestination    = $rawDestination
+            })
+    }
+
+    $operationArray = $operations.ToArray()
+    return [PSCustomObject]@{
+        Success        = $true
+        ValueExists    = [bool]$readResult.Exists
+        RawValue       = $rawValue
+        SnapshotHash   = $snapshotHash
+        Operations     = $operationArray
+        DeleteCount    = @($operationArray | Where-Object Kind -eq 'Delete').Count
+        MoveCount      = @($operationArray | Where-Object Kind -eq 'Move').Count
+        MalformedCount = @($operationArray | Where-Object IsMalformed).Count
+        Error          = $null
+    }
+}
+
+function Add-PathForgePendingFileDelete {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Error = $check.Reason }
+    }
+
+    $queue = Get-PathForgePendingFileQueue
+    if (-not $queue.Success) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Error = $queue.Error }
+    }
+
+    $resolvedPath = [string]$check.Resolved
+    $nativePath = if ($resolvedPath.StartsWith('\\', [System.StringComparison]::Ordinal)) {
+        '\??\UNC\' + $resolvedPath.TrimStart('\')
+    }
+    else {
+        '\??\' + $resolvedPath
+    }
+
+    if (-not $PSCmdlet.ShouldProcess($resolvedPath, 'Append a deletion to PendingFileRenameOperations')) {
+        return [PSCustomObject]@{Success = $true; Simulated = $true; Error = $null }
+    }
+
+    try {
+        $updatedValue = @($queue.RawValue) + @($nativePath, '')
+        Write-PathForgePendingFileRegistryValue -Value $updatedValue
+        return [PSCustomObject]@{Success = $true; Simulated = $false; Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Remove-PathForgePendingFileOperation {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][int[]]$Index,
+        [string]$ExpectedSnapshotHash
+    )
+
+    $queue = Get-PathForgePendingFileQueue
+    if (-not $queue.Success) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Conflict = $false; RemovedCount = 0; RemainingCount = 0; Error = $queue.Error }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSnapshotHash) -and $ExpectedSnapshotHash -ne $queue.SnapshotHash) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Conflict = $true; RemovedCount = 0; RemainingCount = $queue.Operations.Count; Error = 'The reboot queue changed after it was loaded. Refresh before cancelling entries.' }
+    }
+
+    $requestedIndexes = @($Index | Sort-Object -Unique)
+    $availableIndexes = New-Object 'System.Collections.Generic.List[int]'
+    foreach ($operation in @($queue.Operations)) {
+        $availableIndexes.Add([int]$operation.Index)
+    }
+    $invalidIndexes = @($requestedIndexes | Where-Object { $_ -notin $availableIndexes })
+    if ($requestedIndexes.Count -eq 0 -or $invalidIndexes.Count -gt 0) {
+        $invalidText = if ($invalidIndexes.Count -gt 0) { $invalidIndexes -join ', ' } else { '(none)' }
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Conflict = $false; RemovedCount = 0; RemainingCount = $queue.Operations.Count; Error = "Invalid queue index: $invalidText" }
+    }
+
+    $targetDescription = "$($requestedIndexes.Count) pending file operation(s)"
+    if (-not $PSCmdlet.ShouldProcess($targetDescription, 'Cancel selected reboot queue entries')) {
+        return [PSCustomObject]@{Success = $true; Simulated = $true; Conflict = $false; RemovedCount = $requestedIndexes.Count; RemainingCount = $queue.Operations.Count - $requestedIndexes.Count; Error = $null }
+    }
+
+    $removedOffsets = New-Object 'System.Collections.Generic.HashSet[int]'
+    foreach ($operation in @($queue.Operations | Where-Object { $_.Index -in $requestedIndexes })) {
+        $null = $removedOffsets.Add([int]$operation.RawIndex)
+        if ($operation.HasDestination) {
+            $null = $removedOffsets.Add([int]$operation.RawIndex + 1)
+        }
+    }
+
+    $remainingValue = New-Object 'System.Collections.Generic.List[string]'
+    for ($rawIndex = 0; $rawIndex -lt $queue.RawValue.Count; $rawIndex++) {
+        if (-not $removedOffsets.Contains($rawIndex)) {
+            $remainingValue.Add([string]$queue.RawValue[$rawIndex])
+        }
+    }
+
+    try {
+        Write-PathForgePendingFileRegistryValue -Value $remainingValue.ToArray()
+        return [PSCustomObject]@{
+            Success        = $true
+            Simulated      = $false
+            Conflict       = $false
+            RemovedCount   = $requestedIndexes.Count
+            RemainingCount = $queue.Operations.Count - $requestedIndexes.Count
+            Error          = $null
+        }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Conflict = $false; RemovedCount = 0; RemainingCount = $queue.Operations.Count; Error = $_.Exception.Message }
     }
 }
 
@@ -1211,6 +1467,9 @@ Export-ModuleMember -Function @(
     'Test-ReparsePoint',
     'Remove-ReparsePointSafe',
     'Register-BootTimeDelete',
+    'Get-PathForgePendingFileQueue',
+    'Add-PathForgePendingFileDelete',
+    'Remove-PathForgePendingFileOperation',
     'Get-PathForgeDeletionPlan',
     'Import-PathForgeDeletionBatch',
     'Invoke-PathForgeDeletionMethod',

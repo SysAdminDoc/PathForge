@@ -859,6 +859,37 @@ function Get-ValidatedPath {
     return $raw
 }
 
+function Receive-PathDrop {
+    param(
+        [object]$DataObject,
+        [object]$TargetTextBox = $Script:PathTextBox
+    )
+
+    if (-not $TargetTextBox -or -not $DataObject -or -not $DataObject.GetDataPresent('FileDrop')) {
+        return $false
+    }
+
+    $droppedPaths = @($DataObject.GetData('FileDrop'))
+    if ($droppedPaths.Count -eq 0) {
+        return $false
+    }
+
+    $candidate = [string]$droppedPaths[0]
+    $check = Test-SafePath -Path $candidate
+    if (-not $check.Valid) {
+        Write-Console "Dropped path rejected: $($check.Reason)" -Type "Error"
+        return $false
+    }
+
+    $TargetTextBox.Text = $candidate
+    Set-Status "Path loaded from Explorer"
+    Write-Console "Path dropped: $candidate" -Type "Info"
+    if ($droppedPaths.Count -gt 1) {
+        Write-Console "Multiple paths were dropped; using the first of $($droppedPaths.Count)" -Type "Warning"
+    }
+    return $true
+}
+
 # ============================================================================
 # MAIN FORCE DELETE FUNCTION
 # ============================================================================
@@ -2498,6 +2529,22 @@ function Build-FileOpsPage {
     $Script:PathTextBox.Size = New-Object System.Drawing.Size(540, 26)
     $Script:PathTextBox.AccessibleName = "Target file or folder path"
     $Script:PathTextBox.TabIndex = 0
+    $Script:PathTextBox.AllowDrop = $true
+    $Script:PathTextBox.Add_DragEnter({
+        param($control, $dragEvent)
+        $null = $control
+        if ($dragEvent.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+            $dragEvent.Effect = [System.Windows.Forms.DragDropEffects]::Copy
+        }
+        else {
+            $dragEvent.Effect = [System.Windows.Forms.DragDropEffects]::None
+        }
+    })
+    $Script:PathTextBox.Add_DragDrop({
+        param($control, $dragEvent)
+        $null = $control
+        Receive-PathDrop -DataObject $dragEvent.Data -TargetTextBox $Script:PathTextBox | Out-Null
+    })
     $null = $page.Controls.Add($Script:PathTextBox)
     
     $browseFileBtn = New-Object System.Windows.Forms.Button

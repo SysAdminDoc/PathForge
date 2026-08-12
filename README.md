@@ -90,7 +90,7 @@ Invoke-WebRequest -Uri "$baseUrl/PathForge.Core.psm1" -OutFile "$pathForgeDir\Pa
 
 ### Quick Start
 1. Launch PathForge (requires Administrator)
-2. Enter a file/folder path or click **Browse**
+2. Enter a file/folder path, click **Browse**, or drag it from Explorer onto the target field
 3. Select an operation from the appropriate tab
 4. Monitor progress in the console output panel
 

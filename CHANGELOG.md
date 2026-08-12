@@ -11,6 +11,7 @@ All notable changes to PathForge will be documented in this file.
 - Quick volume health card backed by the NTFS corruption-count provider
 - Save button for timestamped formatted console reports
 - Reusable `PathForge.Core.psm1` module for deletion, repair-process, and storage-diagnostic operations
+- Explorer drag-and-drop support for the target path field
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation

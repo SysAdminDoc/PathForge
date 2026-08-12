@@ -8,7 +8,7 @@ BeforeAll {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
 
     $functionNames = @(
-        'Get-ValidatedPath', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
+        'Get-ValidatedPath', 'Receive-PathDrop', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
         'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
         'Set-Status', 'Set-Progress',
@@ -279,6 +279,53 @@ Describe "Defensive path validation coverage" {
 
         $functionAst | Should -Not -BeNullOrEmpty
         $functionAst.Extent.Text | Should -Match 'Test-SafePath\s+-Path\s+\$Path'
+    }
+}
+
+Describe "Explorer path drag and drop" {
+    It "enables file-drop handlers on the path field" {
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+
+        $fileOpsAst.Extent.Text | Should -Match '\$Script:PathTextBox\.AllowDrop\s*=\s*\$true'
+        $fileOpsAst.Extent.Text | Should -Match 'Add_DragEnter'
+        $fileOpsAst.Extent.Text | Should -Match 'Add_DragDrop'
+        $fileOpsAst.Extent.Text | Should -Match 'DragDropEffects\]::Copy'
+    }
+
+    It "uses the first safe path from a multi-path drop" {
+        $originalPathBox = $Script:PathTextBox
+        try {
+            $Script:PathTextBox = [PSCustomObject]@{Text = ''}
+            $dataObject = [PSCustomObject]@{Paths = @('C:\Temp\first.txt', 'C:\Temp\second.txt')}
+            $dataObject | Add-Member -MemberType ScriptMethod -Name GetDataPresent -Value { param($format) return $format -eq 'FileDrop' }
+            $dataObject | Add-Member -MemberType ScriptMethod -Name GetData -Value { param($format) $null = $format; return $this.Paths }
+
+            $result = Receive-PathDrop -DataObject $dataObject -TargetTextBox $Script:PathTextBox
+
+            $result | Should -BeTrue
+            $Script:PathTextBox.Text | Should -Be 'C:\Temp\first.txt'
+        }
+        finally {
+            $Script:PathTextBox = $originalPathBox
+        }
+    }
+
+    It "ignores non-file drag payloads without changing the field" {
+        $originalPathBox = $Script:PathTextBox
+        try {
+            $Script:PathTextBox = [PSCustomObject]@{Text = 'C:\Existing.txt'}
+            $dataObject = [PSCustomObject]@{}
+            $dataObject | Add-Member -MemberType ScriptMethod -Name GetDataPresent -Value { param($format) $null = $format; return $false }
+
+            Receive-PathDrop -DataObject $dataObject -TargetTextBox $Script:PathTextBox | Should -BeFalse
+            $Script:PathTextBox.Text | Should -Be 'C:\Existing.txt'
+        }
+        finally {
+            $Script:PathTextBox = $originalPathBox
+        }
     }
 }
 

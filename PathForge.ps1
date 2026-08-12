@@ -80,6 +80,7 @@ $Script:CurrentTab = ""
 $Script:OperationRunning = $false
 $Script:ActiveProcess = $null
 $Script:RecycleBinCheck = $null
+$Script:DryRunCheck = $null
 $Script:MaxOutputChars = 50000
 
 # ============================================================================
@@ -894,7 +895,11 @@ function Receive-PathDrop {
 # MAIN FORCE DELETE FUNCTION
 # ============================================================================
 function Invoke-ForceDelete {
-    param([string]$Path, [switch]$TakeOwnership)
+    param(
+        [string]$Path,
+        [switch]$TakeOwnership,
+        [switch]$DryRun
+    )
 
     $check = Test-SafePath -Path $Path
     if (-not $check.Valid) {
@@ -909,6 +914,46 @@ function Invoke-ForceDelete {
     if (-not (Test-Path -LiteralPath $Path) -and -not (Test-Path -LiteralPath "\\?\$Path")) {
         Write-Console "Path not found" -Type "Error"
         return $false
+    }
+
+    if ($DryRun) {
+        $includeRecycleBin = $Script:RecycleBinCheck -and $Script:RecycleBinCheck.Checked
+        $plan = Get-PathForgeDeletionPlan -Path $Path -IncludeRecycleBin:$includeRecycleBin -TakeOwnership:$TakeOwnership
+        if (-not $plan.Success) {
+            Write-Console "Dry-run failed: $($plan.Error)" -Type "Error"
+            Set-Status "Ready"
+            return $false
+        }
+
+        Write-Console "=== DRY-RUN DELETION PLAN ===" -Type "Info"
+        Write-Console "No files will be changed or deleted" -Type "Warning"
+        Write-Console "Target: $($plan.Path)" -Type "Normal"
+        Write-Console "Type: $(if ($plan.IsContainer) { 'Directory' } else { 'File' }); Filesystem: $($plan.FileSystem); Reparse point: $($plan.IsReparsePoint)" -Type "Normal"
+        Write-Console "Previewed items: $($plan.ItemCount); Data size: $([math]::Round($plan.TotalBytes / 1MB, 2)) MB" -Type "Normal"
+        if ($plan.Truncated) {
+            Write-Console "Preview truncated at the safety limit; the real operation would include additional descendants" -Type "Warning"
+        }
+
+        Write-Console "" -Type "Normal"
+        Write-Console "Method plan:" -Type "Info"
+        foreach ($method in $plan.Methods) {
+            $state = if ($method.Applicable) { 'WOULD TRY' } else { 'SKIP' }
+            Write-Console "  [$state] $($method.Name) - $($method.Api)" -Type $(if ($method.Applicable) { 'Progress' } else { 'Normal' })
+            Write-Console "           $($method.Reason)" -Type "Normal"
+        }
+
+        Write-Console "" -Type "Normal"
+        Write-Console "Sample targets:" -Type "Info"
+        foreach ($samplePath in $plan.SamplePaths) {
+            Write-Console "  $samplePath" -Type "Normal"
+        }
+        if ($plan.ItemCount -gt $plan.SamplePaths.Count) {
+            Write-Console "  ... and $($plan.ItemCount - $plan.SamplePaths.Count) more previewed item(s)" -Type "Normal"
+        }
+
+        Write-Log "Dry-run deletion plan generated for $Path" -Level "INFO"
+        Set-Status "Dry-run complete - no changes made"
+        return $true
     }
 
     $lockers = @(Get-FileLockProcess -Path $Path)
@@ -1330,7 +1375,10 @@ function Export-ACLReport {
 # BOOT-TIME DELETION
 # ============================================================================
 function Invoke-BootTimeDelete {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [switch]$DryRun
+    )
 
     $check = Test-SafePath -Path $Path
     if (-not $check.Valid) {
@@ -1340,6 +1388,16 @@ function Invoke-BootTimeDelete {
 
     Write-Console "Scheduling boot-time deletion using MoveFileEx API..." -Type "Info"
     Write-Console "Target: $Path" -Type "Normal"
+
+    if ($DryRun) {
+        Write-Console "=== DRY-RUN BOOT-TIME DELETION ===" -Type "Info"
+        Write-Console "No reboot queue or registry values will be changed" -Type "Warning"
+        Write-Console "[WOULD SCHEDULE] MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)" -Type "Progress"
+        Write-Console "[FALLBACK] PendingFileRenameOperations MultiString if MoveFileEx fails" -Type "Normal"
+        Write-Log "Dry-run boot-time deletion generated for $Path" -Level "INFO"
+        Set-Status "Dry-run complete - no changes made"
+        return $true
+    }
     
     try {
         $bootDeleteResult = Register-BootTimeDelete -Path $Path
@@ -2683,6 +2741,18 @@ function Build-FileOpsPage {
     $Script:RecycleBinCheck.Size = New-Object System.Drawing.Size(500, 22)
     $Script:RecycleBinCheck.Checked = $true
     $null = $page.Controls.Add($Script:RecycleBinCheck)
+    $y += 28
+
+    $Script:DryRunCheck = New-Object System.Windows.Forms.CheckBox
+    $Script:DryRunCheck.Text = "Dry-run only (preview delete/schedule APIs; make no changes)"
+    $Script:DryRunCheck.AccessibleName = "Preview deletion without making changes"
+    $Script:DryRunCheck.TabIndex = 8
+    $Script:DryRunCheck.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $Script:DryRunCheck.ForeColor = $Script:Theme.Warning
+    $Script:DryRunCheck.Location = New-Object System.Drawing.Point(30, $y)
+    $Script:DryRunCheck.Size = New-Object System.Drawing.Size(500, 22)
+    $Script:DryRunCheck.Checked = $false
+    $null = $page.Controls.Add($Script:DryRunCheck)
     $y += 35
 
     # ========== ACL INFO PANEL ==========
@@ -2707,7 +2777,7 @@ function Build-FileOpsPage {
             [System.Windows.Forms.MessageBox]::Show("Enter a path first.", "No Path", 0, 48) | Out-Null
             return 
         }
-        Invoke-ForceDelete -Path $Script:PathTextBox.Text -TakeOwnership:$Script:TakeOwnCheck.Checked
+        Invoke-ForceDelete -Path $Script:PathTextBox.Text -TakeOwnership:$Script:TakeOwnCheck.Checked -DryRun:$Script:DryRunCheck.Checked
     }
     $null = $page.Controls.Add($card1)
     
@@ -2716,7 +2786,7 @@ function Build-FileOpsPage {
             [System.Windows.Forms.MessageBox]::Show("Enter a path first.", "No Path", 0, 48) | Out-Null
             return 
         }
-        Invoke-BootTimeDelete -Path $Script:PathTextBox.Text
+        Invoke-BootTimeDelete -Path $Script:PathTextBox.Text -DryRun:$Script:DryRunCheck.Checked
     }
     $null = $page.Controls.Add($card2)
     

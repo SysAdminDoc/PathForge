@@ -108,6 +108,8 @@ PathForge offers six deletion methods in order of escalation:
 
 If all methods fail, use **Schedule Boot-Time Deletion** — the file will be removed before Windows fully loads.
 
+Enable **Dry-run only** to inventory the target, preview a bounded sample, and see which deletion API would run at each escalation step without changing files, ownership, links, the Recycle Bin, or the reboot queue.
+
 ### Repair Sequence
 For corrupted systems, run repairs in this order:
 

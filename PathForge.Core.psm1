@@ -202,8 +202,12 @@ function Get-VolumeFileSystem {
 }
 
 function Move-ToRecycleBin {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param([string]$Path)
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Move to the Recycle Bin')) {
+        return @{Success = $true; Method = 'WhatIf: Recycle Bin'; Simulated = $true }
+    }
 
     try {
         if (Test-Path -LiteralPath $Path -PathType Container) {
@@ -408,8 +412,12 @@ function Remove-ReparsePointSafe {
 }
 
 function Register-BootTimeDelete {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess)]
     param([string]$Path)
+
+    if (-not $PSCmdlet.ShouldProcess($Path, 'Schedule deletion for the next boot with MoveFileEx')) {
+        return @{Success = $true; Method = 'WhatIf: Boot-time MoveFileEx'; Simulated = $true }
+    }
 
     try {
         if ([PathForgeBootDeleteNative]::ScheduleDelete($Path)) {
@@ -421,6 +429,119 @@ function Register-BootTimeDelete {
     }
     catch {
         return @{Success = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Get-PathForgeDeletionPlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [switch]$IncludeRecycleBin,
+        [switch]$TakeOwnership,
+        [ValidateRange(1, 100000)]
+        [int]$MaxPreviewItems = 10000,
+        [ValidateRange(1, 100)]
+        [int]$SampleSize = 25
+    )
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return [PSCustomObject]@{
+            Success = $false
+            Path    = $Path
+            Error   = $check.Reason
+        }
+    }
+
+    try {
+        $target = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch {
+        return [PSCustomObject]@{
+            Success = $false
+            Path    = $Path
+            Error   = $_.Exception.Message
+        }
+    }
+
+    $isContainer = [bool]$target.PSIsContainer
+    $isReparsePoint = ($target.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    $fileSystem = Get-VolumeFileSystem -Path $Path
+    $previewItems = @($target)
+    $truncated = $false
+
+    if ($isContainer -and -not $isReparsePoint) {
+        $children = @(Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First ($MaxPreviewItems + 1))
+        if ($children.Count -gt $MaxPreviewItems) {
+            $truncated = $true
+            $children = @($children | Select-Object -First $MaxPreviewItems)
+        }
+        $previewItems += $children
+    }
+
+    [int64]$totalBytes = 0
+    foreach ($previewItem in $previewItems) {
+        if (-not $previewItem.PSIsContainer -and $null -ne $previewItem.Length) {
+            $totalBytes += [int64]$previewItem.Length
+        }
+    }
+
+    $methods = New-Object 'System.Collections.Generic.List[object]'
+    $order = 0
+    $addMethod = {
+        param(
+            [string]$Name,
+            [string]$Api,
+            [bool]$Applicable,
+            [string]$Reason,
+            [bool]$Recoverable = $false
+        )
+
+        $order++
+        $methods.Add([PSCustomObject]@{
+                Order       = $order
+                Name        = $Name
+                Api         = $Api
+                Applicable  = $Applicable
+                Reason      = $Reason
+                Recoverable = $Recoverable
+            })
+    }.GetNewClosure()
+
+    if ($TakeOwnership) {
+        $null = & $addMethod 'Take Ownership' 'takeown.exe + icacls.exe' $true 'Requested prerequisite before permanent deletion'
+    }
+    $null = & $addMethod 'Recycle Bin' 'Microsoft.VisualBasic.FileIO.FileSystem' ([bool]$IncludeRecycleBin) $(if ($IncludeRecycleBin) { 'Enabled as the first recoverable attempt' } else { 'Recycle Bin option is disabled' }) $true
+    $null = & $addMethod 'Reparse Point Removal' 'cmd.exe rmdir (link only)' $isReparsePoint $(if ($isReparsePoint) { 'Target is a reparse point; remove the link without traversing it' } else { 'Target is not a reparse point' })
+
+    $permanentReason = if ($isReparsePoint) { 'Skipped unless safe link-only removal is declined' } else { 'Applicable permanent deletion attempt' }
+    $permanentApplicable = -not $isReparsePoint
+    $null = & $addMethod 'Standard PowerShell' 'Remove-Item -LiteralPath -Force -Recurse' $permanentApplicable $permanentReason
+    $null = & $addMethod '.NET Framework' 'System.IO.File.Delete / Directory.Delete' $permanentApplicable $permanentReason
+    $null = & $addMethod 'Long Path' 'cmd.exe del/rd with the \\?\ prefix' $permanentApplicable $permanentReason
+    $shortNameApplicable = $permanentApplicable -and $fileSystem -eq 'NTFS'
+    $shortNameReason = if ($fileSystem -eq 'NTFS') { $permanentReason } else { "$fileSystem does not support the NTFS 8.3 method" }
+    $null = & $addMethod '8.3 Short Name' 'Scripting.FileSystemObject + Remove-Item' $shortNameApplicable $shortNameReason
+    $robocopyApplicable = $permanentApplicable -and $isContainer
+    $robocopyReason = if (-not $isContainer) { 'Robocopy mirror applies only to directories' } else { $permanentReason }
+    $null = & $addMethod 'Robocopy Mirror' 'robocopy.exe /MIR + cmd.exe rd' $robocopyApplicable $robocopyReason
+    $null = & $addMethod 'WMI/CIM' 'Win32_Directory or CIM_DataFile Delete()' $permanentApplicable $permanentReason
+    $null = & $addMethod 'Boot-Time Delete' 'MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)' $true 'Fallback if all immediate methods fail'
+
+    return [PSCustomObject]@{
+        Success        = $true
+        Path           = $target.FullName
+        FileSystem     = $fileSystem
+        IsContainer    = $isContainer
+        IsReparsePoint = $isReparsePoint
+        ItemCount      = $previewItems.Count
+        TotalBytes     = $totalBytes
+        Truncated      = $truncated
+        SamplePaths    = @($previewItems | Select-Object -First $SampleSize | ForEach-Object FullName)
+        Methods        = $methods.ToArray()
+        Error          = $null
     }
 }
 
@@ -878,6 +999,7 @@ Export-ModuleMember -Function @(
     'Test-ReparsePoint',
     'Remove-ReparsePointSafe',
     'Register-BootTimeDelete',
+    'Get-PathForgeDeletionPlan',
     'Get-DriveSmartHealth',
     'Get-VolumeCorruptionRecord',
     'Get-PathForgeRepairCommand',

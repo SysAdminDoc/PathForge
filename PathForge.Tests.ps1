@@ -9,7 +9,7 @@ BeforeAll {
 
     $functionNames = @(
         'Get-ValidatedPath', 'Receive-PathDrop', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
-        'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth',
+        'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth', 'Invoke-ForceDelete', 'Invoke-BootTimeDelete',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
         'Set-Status', 'Set-Progress',
         'Enter-Operation', 'Exit-Operation', 'Stop-ActiveOperation'
@@ -108,6 +108,24 @@ Describe "PathForge.Core module boundary" {
         Test-Path -LiteralPath $target | Should -BeTrue
     }
 
+    It "exposes WhatIf on every exported deletion method" {
+        foreach ($commandName in @(
+                'Move-ToRecycleBin', 'Remove-ItemStandard', 'Remove-ItemDotNet',
+                'Remove-ItemLongPath', 'Remove-ItemShortName', 'Remove-ItemRobocopy',
+                'Remove-ItemWMI', 'Remove-ReparsePointSafe', 'Register-BootTimeDelete')) {
+            (Get-Command $commandName).Parameters.ContainsKey('WhatIf') | Should -BeTrue
+        }
+    }
+
+    It "previews recycle-bin and boot-time methods without changing the target" {
+        $target = Join-Path $TestDrive 'whatif-fallbacks.txt'
+        Set-Content -LiteralPath $target -Value 'keep me too'
+
+        (Move-ToRecycleBin -Path $target -WhatIf).Simulated | Should -BeTrue
+        (Register-BootTimeDelete -Path $target -WhatIf).Simulated | Should -BeTrue
+        Test-Path -LiteralPath $target | Should -BeTrue
+    }
+
     It "aggregates storage diagnostics without WinForms" {
         Mock Get-PathForgePhysicalDisk -ModuleName PathForge.Core { [PSCustomObject]@{FriendlyName = 'Disk A'} }
         Mock Get-PathForgeVolume -ModuleName PathForge.Core { [PSCustomObject]@{DriveLetter = 'C'} }
@@ -146,6 +164,24 @@ Describe "PathForge.Core module boundary" {
             }
             $manifest.hash[$index] | Should -Be $actualHash
         }
+    }
+
+    It "builds a non-mutating deletion plan with applicable APIs" {
+        $targetDirectory = Join-Path $TestDrive 'dry-run-target'
+        $childFile = Join-Path $targetDirectory 'child.txt'
+        New-Item -Path $targetDirectory -ItemType Directory | Out-Null
+        Set-Content -LiteralPath $childFile -Value 'preview me'
+
+        $plan = Get-PathForgeDeletionPlan -Path $targetDirectory -IncludeRecycleBin -TakeOwnership
+
+        $plan.Success | Should -BeTrue
+        $plan.IsContainer | Should -BeTrue
+        $plan.ItemCount | Should -Be 2
+        $plan.TotalBytes | Should -BeGreaterThan 0
+        $plan.Methods.Name | Should -Contain 'Take Ownership'
+        ($plan.Methods | Where-Object Name -eq 'Recycle Bin').Applicable | Should -BeTrue
+        ($plan.Methods | Where-Object Name -eq 'Robocopy Mirror').Applicable | Should -BeTrue
+        Test-Path -LiteralPath $childFile | Should -BeTrue
     }
 }
 
@@ -326,6 +362,73 @@ Describe "Explorer path drag and drop" {
         finally {
             $Script:PathTextBox = $originalPathBox
         }
+    }
+}
+
+Describe "Deletion dry-run GUI wiring" {
+    It "passes the dry-run selection into force deletion" {
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+
+        $fileOpsAst.Extent.Text | Should -Match '\$Script:DryRunCheck\.Text\s*=\s*"Dry-run only'
+        $fileOpsAst.Extent.Text | Should -Match 'Invoke-ForceDelete[^\r\n]+-DryRun:\$Script:DryRunCheck\.Checked'
+        $fileOpsAst.Extent.Text | Should -Match 'Invoke-BootTimeDelete[^\r\n]+-DryRun:\$Script:DryRunCheck\.Checked'
+    }
+
+    It "returns before lock discovery or mutation in dry-run mode" {
+        $forceDeleteAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Invoke-ForceDelete'
+        }, $true) | Select-Object -First 1
+        $functionText = $forceDeleteAst.Extent.Text
+
+        $functionText.IndexOf('if ($DryRun)') | Should -BeGreaterThan -1
+        $functionText.IndexOf('if ($DryRun)') | Should -BeLessThan $functionText.IndexOf('Get-FileLockProcess')
+        $functionText | Should -Match 'Get-PathForgeDeletionPlan'
+        $functionText | Should -Match 'No files will be changed or deleted'
+    }
+
+    It "generates a plan without querying locks or changing the target" {
+        $target = Join-Path $TestDrive 'gui-dry-run.txt'
+        Set-Content -LiteralPath $target -Value 'preserve this file'
+        $originalRecycleCheck = $Script:RecycleBinCheck
+        try {
+            $Script:RecycleBinCheck = [PSCustomObject]@{Checked = $true}
+            Mock Write-Console
+            Mock Write-Log
+            Mock Set-Status
+            Mock Get-FileLockProcess { throw 'lock discovery must not run during dry-run' }
+            Mock Move-ToRecycleBin { throw 'recycle bin must not run during dry-run' }
+            Mock Remove-ItemStandard { throw 'deletion must not run during dry-run' }
+
+            Invoke-ForceDelete -Path $target -TakeOwnership -DryRun | Should -BeTrue
+
+            Test-Path -LiteralPath $target | Should -BeTrue
+            Should -Invoke Get-FileLockProcess -Times 0
+            Should -Invoke Move-ToRecycleBin -Times 0
+            Should -Invoke Remove-ItemStandard -Times 0
+        }
+        finally {
+            $Script:RecycleBinCheck = $originalRecycleCheck
+        }
+    }
+
+    It "previews boot-time scheduling without calling MoveFileEx or the registry" {
+        $target = Join-Path $TestDrive 'boot-dry-run.txt'
+        Set-Content -LiteralPath $target -Value 'preserve boot target'
+        Mock Write-Console
+        Mock Write-Log
+        Mock Set-Status
+        Mock Register-BootTimeDelete { throw 'MoveFileEx must not run during dry-run' }
+        Mock Set-ItemProperty { throw 'registry must not change during dry-run' }
+
+        Invoke-BootTimeDelete -Path $target -DryRun | Should -BeTrue
+
+        Test-Path -LiteralPath $target | Should -BeTrue
+        Should -Invoke Register-BootTimeDelete -Times 0
+        Should -Invoke Set-ItemProperty -Times 0
     }
 }
 

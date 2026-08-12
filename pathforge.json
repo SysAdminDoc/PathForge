@@ -3,14 +3,23 @@
     "description": "Windows Filesystem Repair & Deletion Suite with educational panels",
     "homepage": "https://github.com/SysAdminDoc/PathForge",
     "license": "MIT",
-    "url": "https://github.com/SysAdminDoc/PathForge/releases/download/v3.1.0/PathForge.ps1",
-    "hash": "7F5B1423DD1EEE44FD5508BF270E732F7B9EAFA350F2A6D6A9B57CE84BF056DE",
+    "url": [
+        "https://github.com/SysAdminDoc/PathForge/releases/download/v3.1.0/PathForge.ps1",
+        "https://github.com/SysAdminDoc/PathForge/releases/download/v3.1.0/PathForge.Core.psm1"
+    ],
+    "hash": [
+        "224CF9DC4939F36EA4D94C04BCF0C95AE763639FDED57F760BF71577BB625F3B",
+        "42862163480E17F49544A5671C6B5A2BE35DF679FA22B3D03664D6AA892913C9"
+    ],
     "bin": [
         ["PathForge.ps1", "pathforge", "-ExecutionPolicy Bypass -NoProfile -File"]
     ],
     "checkver": "github",
     "autoupdate": {
-        "url": "https://github.com/SysAdminDoc/PathForge/releases/download/v$version/PathForge.ps1"
+        "url": [
+            "https://github.com/SysAdminDoc/PathForge/releases/download/v$version/PathForge.ps1",
+            "https://github.com/SysAdminDoc/PathForge/releases/download/v$version/PathForge.Core.psm1"
+        ]
     },
     "notes": "Run as Administrator: pathforge (or right-click PathForge.ps1 -> Run with PowerShell)"
 }

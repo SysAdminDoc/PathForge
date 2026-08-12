@@ -10,12 +10,15 @@ All notable changes to PathForge will be documented in this file.
 - Pre-repair SMART failure warning for CHKDSK /F and /R with an explicit override
 - Quick volume health card backed by the NTFS corruption-count provider
 - Save button for timestamped formatted console reports
+- Reusable `PathForge.Core.psm1` module for deletion, repair-process, and storage-diagnostic operations
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation
 - Bound the output console to 50,000 characters while preserving a visible trim marker
 - Apply safe-path validation consistently to ADS scanning/removal and file-unblock operations
 - Always remove the temporary empty directory after Robocopy failures
+- Stream DISM, SFC, and CHKDSK output through one testable core runner instead of duplicated GUI handlers
+- Package the GUI script and required core module together in the Scoop manifest
 
 ## [v3.1.0] - 2026-06-20
 

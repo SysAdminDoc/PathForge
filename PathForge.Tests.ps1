@@ -2,14 +2,14 @@
 
 BeforeAll {
     $scriptPath = Join-Path $PSScriptRoot "PathForge.ps1"
+    $coreModulePath = Join-Path $PSScriptRoot "PathForge.Core.psm1"
+    $manifestPath = Join-Path $PSScriptRoot "pathforge.json"
+    Import-Module $coreModulePath -Force
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
 
     $functionNames = @(
-        'Test-SafePath', 'Get-ValidatedPath', 'Get-VolumeFileSystem',
-        'Get-FileLockProcess', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
-        'Get-DriveSmartHealth', 'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth',
-        'Test-ReparsePoint', 'Remove-ReparsePointSafe',
-        'Remove-ItemStandard', 'Remove-ItemDotNet', 'Remove-ItemRobocopy',
+        'Get-ValidatedPath', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
+        'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
         'Set-Status', 'Set-Progress',
         'Enter-Operation', 'Exit-Operation', 'Stop-ActiveOperation'
@@ -24,6 +24,128 @@ BeforeAll {
     $hashAsts = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.VariablePath.UserPath -match '^Script:' }, $true)
     foreach ($ha in $hashAsts) {
         try { Invoke-Expression $ha.Extent.Text } catch { }
+    }
+}
+
+Describe "PathForge.Core module boundary" {
+    It "loads reusable operations from the core module" {
+        foreach ($commandName in @(
+                'Test-SafePath', 'Remove-ItemStandard', 'Get-DriveSmartHealth',
+                'Get-PathForgeRepairCommand', 'Get-PathForgeDriveHealth')) {
+            (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
+        }
+    }
+
+    It "keeps extracted core definitions out of the GUI script" {
+        $scriptFunctionNames = @($ast.FindAll({
+                    $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | ForEach-Object Name)
+
+        foreach ($commandName in @(
+                'Test-SafePath', 'Get-FileLockProcess', 'Get-VolumeFileSystem',
+                'Remove-ItemStandard', 'Get-DriveSmartHealth')) {
+            $scriptFunctionNames | Should -Not -Contain $commandName
+        }
+    }
+
+    It "maps repair operations to reusable native commands" {
+        $scan = Get-PathForgeRepairCommand -Operation ChkdskScan -Drive 'D:'
+        $full = Get-PathForgeRepairCommand -Operation ChkdskFull -Drive 'D:'
+        $sfc = Get-PathForgeRepairCommand -Operation SfcScan
+
+        $scan.FilePath | Should -Be 'chkdsk.exe'
+        $scan.Arguments | Should -Be 'D: /scan'
+        $full.Arguments | Should -Be 'D: /R /X'
+        $sfc.FilePath | Should -Be 'sfc.exe'
+        $sfc.Arguments | Should -Be '/scannow'
+    }
+
+    It "parses TRIM status output without GUI dependencies" {
+        $items = @(ConvertFrom-PathForgeTrimOutput -InputLine @(
+                'NTFS DisableDeleteNotify = 0  (Disabled)',
+                'ReFS DisableDeleteNotify = 1  (Enabled)'))
+
+        $items.Count | Should -Be 2
+        $items[0].FileSystem | Should -Be 'NTFS'
+        $items[0].Enabled | Should -BeTrue
+        $items[1].Enabled | Should -BeFalse
+    }
+
+    It "streams native repair output through callbacks" {
+        Mock Get-PathForgeRepairCommand -ModuleName PathForge.Core {
+            [PSCustomObject]@{
+                Operation        = 'ChkdskScan'
+                FilePath         = 'cmd.exe'
+                Arguments        = '/d /c "echo 42 percent"'
+                ProgressPattern  = '(\d+)\s*percent'
+                SuccessExitCodes = @(0)
+                StallSeconds     = 0
+            }
+        }
+        $outputLines = New-Object 'System.Collections.Generic.List[string]'
+        $progressValues = New-Object 'System.Collections.Generic.List[int]'
+
+        $result = Invoke-PathForgeRepair -Operation ChkdskScan -Drive 'D:' `
+            -OutputAction { param($line) $outputLines.Add($line) } `
+            -ProgressCallback { param($percent, $display) $null = $display; $progressValues.Add($percent) }
+
+        $result.Success | Should -BeTrue
+        $result.Output | Should -Contain '42 percent'
+        $outputLines | Should -Contain '42 percent'
+        $progressValues | Should -Contain 42
+        @(Get-EventSubscriber | Where-Object SourceIdentifier -Like 'PathForge.*').Count | Should -Be 0
+        @(Get-Job | Where-Object Name -Like 'PathForge.*').Count | Should -Be 0
+    }
+
+    It "supports non-mutating previews for extracted deletion methods" {
+        $target = Join-Path $TestDrive 'whatif-delete.txt'
+        Set-Content -LiteralPath $target -Value 'keep me'
+
+        $result = Remove-ItemStandard -Path $target -WhatIf
+
+        $result.Success | Should -BeTrue
+        $result.Simulated | Should -BeTrue
+        Test-Path -LiteralPath $target | Should -BeTrue
+    }
+
+    It "aggregates storage diagnostics without WinForms" {
+        Mock Get-PathForgePhysicalDisk -ModuleName PathForge.Core { [PSCustomObject]@{FriendlyName = 'Disk A'} }
+        Mock Get-PathForgeVolume -ModuleName PathForge.Core { [PSCustomObject]@{DriveLetter = 'C'} }
+        Mock Get-PathForgeSmartStatus -ModuleName PathForge.Core {
+            [PSCustomObject]@{Success = $true; Items = @([PSCustomObject]@{PredictFailure = $false}); Error = $null }
+        }
+        Mock Get-PathForgeReliabilityCounter -ModuleName PathForge.Core {
+            [PSCustomObject]@{Success = $true; Items = @([PSCustomObject]@{DeviceId = 0}); Error = $null }
+        }
+
+        $report = Get-PathForgeDriveHealth
+
+        $report.PhysicalDisks.Count | Should -Be 1
+        $report.Volumes.Count | Should -Be 1
+        $report.SmartStatuses.Count | Should -Be 1
+        $report.ReliabilityCounters.Count | Should -Be 1
+        $report.Errors.Count | Should -Be 0
+    }
+
+    It "packages the GUI and core module together in the Scoop manifest" {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+        $expectedFiles = @('PathForge.ps1', 'PathForge.Core.psm1')
+
+        @($manifest.url).Count | Should -Be 2
+        @($manifest.hash).Count | Should -Be 2
+        for ($index = 0; $index -lt $expectedFiles.Count; $index++) {
+            [System.IO.Path]::GetFileName([string]$manifest.url[$index]) | Should -Be $expectedFiles[$index]
+            $stream = [System.IO.File]::OpenRead((Join-Path $PSScriptRoot $expectedFiles[$index]))
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $actualHash = [System.BitConverter]::ToString($sha256.ComputeHash($stream)).Replace('-', '')
+            }
+            finally {
+                $sha256.Dispose()
+                $stream.Dispose()
+            }
+            $manifest.hash[$index] | Should -Be $actualHash
+        }
     }
 }
 
@@ -215,7 +337,7 @@ Describe "Remove-ItemRobocopy cleanup" {
         $target = Join-Path $TestDrive "robocopy-target"
         New-Item -Path $tempRoot -ItemType Directory -Force | Out-Null
         New-Item -Path $target -ItemType Directory -Force | Out-Null
-        function robocopy { throw "simulated Robocopy failure" }
+        Mock robocopy -ModuleName PathForge.Core { throw "simulated Robocopy failure" }
 
         try {
             $env:TEMP = $tempRoot
@@ -226,15 +348,14 @@ Describe "Remove-ItemRobocopy cleanup" {
         }
         finally {
             $env:TEMP = $originalTemp
-            Remove-Item Function:\robocopy -ErrorAction SilentlyContinue
         }
     }
 }
 
 Describe "Get-DriveSmartHealth" {
     It "maps the selected volume to its physical SMART record" {
-        Mock Get-Partition { [PSCustomObject]@{ DiskNumber = 4 } }
-        Mock Get-CimInstance {
+        Mock Get-Partition -ModuleName PathForge.Core { [PSCustomObject]@{ DiskNumber = 4 } }
+        Mock Get-CimInstance -ModuleName PathForge.Core {
             if ($ClassName -eq 'Win32_DiskDrive') {
                 return [PSCustomObject]@{ PNPDeviceID = 'SCSI\DISK&VEN_TEST'; Model = 'Test Disk' }
             }
@@ -272,13 +393,13 @@ Describe "Confirm-RepairDriveHealth" {
 
 Describe "Get-VolumeCorruptionHealth" {
     It "returns and reports the volume corruption count" {
-        Mock Get-VolumeCorruptionCount { [uint32]3 }
+        Mock Get-VolumeCorruptionCount -ModuleName PathForge.Core { [uint32]3 }
 
         $result = Get-VolumeCorruptionHealth -Drive "C:"
 
         $result.Available | Should -BeTrue
         $result.CorruptionCount | Should -Be 3
-        Should -Invoke Get-VolumeCorruptionCount -Times 1 -ParameterFilter { $DriveLetter -eq 'C' }
+        Should -Invoke Get-VolumeCorruptionCount -ModuleName PathForge.Core -Times 1 -ParameterFilter { $DriveLetter -eq 'C' }
     }
 }
 

@@ -53,124 +53,8 @@ public class DarkMode {
 }
 "@ -ErrorAction SilentlyContinue
 
-# Recycle Bin support
-Add-Type -AssemblyName Microsoft.VisualBasic
-
-# Boot-time deletion API (MoveFileEx)
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public class BootDelete {
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
-    public const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x4;
-    public static bool ScheduleDelete(string path) {
-        return MoveFileEx(path, null, MOVEFILE_DELAY_UNTIL_REBOOT);
-    }
-}
-"@ -ErrorAction SilentlyContinue
-
-# Restart Manager lock-holder discovery
-Add-Type -TypeDefinition @"
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-
-public static class RestartManagerNative {
-    private const int ERROR_SUCCESS = 0;
-    private const int ERROR_MORE_DATA = 234;
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RM_UNIQUE_PROCESS {
-        public int dwProcessId;
-        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    public struct RM_PROCESS_INFO {
-        public RM_UNIQUE_PROCESS Process;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
-        public string strAppName;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
-        public string strServiceShortName;
-        public uint ApplicationType;
-        public uint AppStatus;
-        public uint TSSessionId;
-        [MarshalAs(UnmanagedType.Bool)]
-        public bool bRestartable;
-    }
-
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
-
-    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
-    private static extern int RmRegisterResources(
-        uint dwSessionHandle,
-        uint nFiles,
-        string[] rgsFilenames,
-        uint nApplications,
-        RM_UNIQUE_PROCESS[] rgApplications,
-        uint nServices,
-        string[] rgsServiceNames);
-
-    [DllImport("rstrtmgr.dll")]
-    private static extern int RmGetList(
-        uint dwSessionHandle,
-        out uint pnProcInfoNeeded,
-        ref uint pnProcInfo,
-        [In, Out] RM_PROCESS_INFO[] rgAffectedApps,
-        ref uint lpdwRebootReasons);
-
-    [DllImport("rstrtmgr.dll")]
-    private static extern int RmEndSession(uint pSessionHandle);
-
-    public static RM_PROCESS_INFO[] GetLockingProcesses(string path) {
-        if (String.IsNullOrEmpty(path)) {
-            return new RM_PROCESS_INFO[0];
-        }
-
-        uint sessionHandle;
-        int result = RmStartSession(out sessionHandle, 0, Guid.NewGuid().ToString("N"));
-        if (result != ERROR_SUCCESS) {
-            throw new InvalidOperationException("RmStartSession failed with code " + result);
-        }
-
-        try {
-            result = RmRegisterResources(sessionHandle, 1, new string[] { path }, 0, null, 0, null);
-            if (result != ERROR_SUCCESS) {
-                throw new InvalidOperationException("RmRegisterResources failed with code " + result);
-            }
-
-            uint needed;
-            uint count = 0;
-            uint rebootReasons = 0;
-            result = RmGetList(sessionHandle, out needed, ref count, null, ref rebootReasons);
-            if (result != ERROR_SUCCESS && result != ERROR_MORE_DATA) {
-                throw new InvalidOperationException("RmGetList failed with code " + result);
-            }
-            if (needed == 0) {
-                return new RM_PROCESS_INFO[0];
-            }
-
-            RM_PROCESS_INFO[] affected = new RM_PROCESS_INFO[needed];
-            count = needed;
-            result = RmGetList(sessionHandle, out needed, ref count, affected, ref rebootReasons);
-            if (result != ERROR_SUCCESS) {
-                throw new InvalidOperationException("RmGetList failed with code " + result);
-            }
-
-            var resultList = new List<RM_PROCESS_INFO>();
-            for (int i = 0; i < count; i++) {
-                resultList.Add(affected[i]);
-            }
-            return resultList.ToArray();
-        }
-        finally {
-            RmEndSession(sessionHandle);
-        }
-    }
-}
-"@ -ErrorAction SilentlyContinue
+$coreModulePath = Join-Path $PSScriptRoot 'PathForge.Core.psm1'
+Import-Module $coreModulePath -Force
 
 # ============================================================================
 # CONFIGURATION
@@ -963,23 +847,6 @@ function Stop-ActiveOperation {
 # ============================================================================
 # PATH VALIDATION
 # ============================================================================
-function Test-SafePath {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return @{Valid = $false; Reason = "Path is empty" }
-    }
-    if ($Path -match '[;|&`$\(\)]') {
-        return @{Valid = $false; Reason = "Path contains dangerous characters: ; | & ` $ ( )" }
-    }
-    try {
-        $resolved = [System.IO.Path]::GetFullPath($Path)
-        return @{Valid = $true; Resolved = $resolved }
-    }
-    catch {
-        return @{Valid = $false; Reason = "Invalid path format: $($_.Exception.Message)" }
-    }
-}
-
 function Get-ValidatedPath {
     $raw = $Script:PathTextBox.Text
     $check = Test-SafePath -Path $raw
@@ -990,221 +857,6 @@ function Get-ValidatedPath {
         return $null
     }
     return $raw
-}
-
-function Get-FileLockProcess {
-    param([string]$Path)
-
-    $check = Test-SafePath -Path $Path
-    if (-not $check.Valid) {
-        return @()
-    }
-
-    try {
-        $processes = @([RestartManagerNative]::GetLockingProcesses($Path))
-    }
-    catch {
-        Write-Log "Restart Manager query failed for $Path : $_" -Level "WARN"
-        return @()
-    }
-
-    foreach ($process in $processes) {
-        $processId = [int]$process.Process.dwProcessId
-        if ($processId -le 0 -or $processId -eq $PID) {
-            continue
-        }
-
-        $processName = $process.strAppName
-        if ([string]::IsNullOrWhiteSpace($processName)) {
-            try {
-                $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName
-            }
-            catch {
-                $processName = "Unknown process"
-            }
-        }
-
-        [PSCustomObject]@{
-            ProcessName = $processName
-            ProcessId   = $processId
-            ServiceName = $process.strServiceShortName
-        }
-    }
-}
-
-function Get-VolumeFileSystem {
-    param([string]$Path)
-    try {
-        $root = [System.IO.Path]::GetPathRoot($Path)
-        if (-not $root -or $root.StartsWith('\\')) { return "Unknown" }
-        $letter = $root.TrimEnd('\', ':')
-        if ($letter.Length -ne 1 -or $letter -notmatch '[A-Za-z]') { return "Unknown" }
-        $vol = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
-        if ($vol) { return $vol.FileSystem }
-    }
-    catch { Write-Log "Volume filesystem query failed for $Path : $_" -Level "WARN" }
-    return "Unknown"
-}
-
-# ============================================================================
-# RECYCLE BIN
-# ============================================================================
-function Move-ToRecycleBin {
-    param([string]$Path)
-    try {
-        if (Test-Path -LiteralPath $Path -PathType Container) {
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
-                $Path,
-                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
-        }
-        else {
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile(
-                $Path,
-                [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
-                [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)
-        }
-        return @{Success = $true; Method = "Recycle Bin" }
-    }
-    catch {
-        return @{Success = $false; Error = $_.Exception.Message }
-    }
-}
-
-# ============================================================================
-# DELETION METHODS (6 escalating techniques from research)
-# ============================================================================
-function Remove-ItemStandard {
-    param([string]$Path)
-    try {
-        Remove-Item -LiteralPath $Path -Force -Recurse -ErrorAction Stop
-        return @{Success = $true; Method = "Standard PowerShell" }
-    }
-    catch { return @{Success = $false; Error = $_.Exception.Message } }
-}
-
-function Remove-ItemDotNet {
-    param([string]$Path)
-    try {
-        if (Test-Path -LiteralPath $Path -PathType Container) {
-            [System.IO.Directory]::Delete($Path, $true)
-        }
-        else {
-            [System.IO.File]::Delete($Path)
-        }
-        return @{Success = $true; Method = ".NET Framework" }
-    }
-    catch { return @{Success = $false; Error = $_.Exception.Message } }
-}
-
-function Remove-ItemLongPath {
-    param([string]$Path)
-    try {
-        $longPath = "\\?\$Path"
-        if (Test-Path -LiteralPath $Path -PathType Container) {
-            $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
-        }
-        else {
-            $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "del /f /q `"$longPath`"" -NoNewWindow -Wait -PassThru 2>$null
-        }
-        if (-not (Test-Path -LiteralPath $Path)) {
-            return @{Success = $true; Method = "Long Path (\\?\)" }
-        }
-        return @{Success = $false; Error = "Path still exists" }
-    }
-    catch { return @{Success = $false; Error = $_.Exception.Message } }
-}
-
-function Remove-ItemShortName {
-    param([string]$Path)
-    try {
-        $fso = New-Object -ComObject Scripting.FileSystemObject
-        $shortPath = if (Test-Path -LiteralPath $Path -PathType Container) {
-            $fso.GetFolder($Path).ShortPath
-        }
-        else {
-            $fso.GetFile($Path).ShortPath
-        }
-        [System.Runtime.Interopservices.Marshal]::ReleaseComObject($fso) | Out-Null
-        
-        if ($shortPath -and $shortPath -ne $Path) {
-            Remove-Item -LiteralPath $shortPath -Force -Recurse -ErrorAction Stop
-            return @{Success = $true; Method = "8.3 Short Name" }
-        }
-        return @{Success = $false; Error = "No short name available" }
-    }
-    catch { return @{Success = $false; Error = $_.Exception.Message } }
-}
-
-function Remove-ItemRobocopy {
-    param([string]$Path)
-    $emptyDir = $null
-    try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-            return @{Success = $false; Error = "Robocopy only works on directories" }
-        }
-        $emptyDir = Join-Path $env:TEMP "PathForge_Empty_$(Get-Random)"
-        New-Item -Path $emptyDir -ItemType Directory -Force | Out-Null
-        
-        Write-Console "  Robocopy: Mirroring empty folder over target..." -Type "Progress"
-        $null = robocopy $emptyDir $Path /MIR /R:0 /W:0 /NFL /NDL /NJH /NJS 2>&1
-        
-        $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$Path`"" -NoNewWindow -Wait -PassThru 2>$null
-
-        if (-not (Test-Path -LiteralPath $Path)) {
-            return @{Success = $true; Method = "Robocopy Mirror" }
-        }
-        return @{Success = $false; Error = "Directory still exists" }
-    }
-    catch { return @{Success = $false; Error = $_.Exception.Message } }
-    finally {
-        if ($emptyDir -and (Test-Path -LiteralPath $emptyDir)) {
-            Remove-Item -LiteralPath $emptyDir -Force -Recurse -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-function Remove-ItemWMI {
-    param([string]$Path)
-    try {
-        $escapedPath = $Path -replace '\\', '\\'
-        $item = if (Test-Path -LiteralPath $Path -PathType Container) {
-            Get-CimInstance -ClassName Win32_Directory -Filter "Name='$escapedPath'" -ErrorAction Stop
-        }
-        else {
-            Get-CimInstance -ClassName CIM_DataFile -Filter "Name='$escapedPath'" -ErrorAction Stop
-        }
-        
-        if ($item) {
-            $result = $item | Invoke-CimMethod -MethodName Delete
-            if ($result.ReturnValue -eq 0) {
-                return @{Success = $true; Method = "WMI/CIM" }
-            }
-        }
-        return @{Success = $false; Error = "WMI deletion failed" }
-    }
-    catch { return @{Success = $false; Error = $_.Exception.Message } }
-}
-
-# ============================================================================
-# REPARSE POINT HANDLING
-# ============================================================================
-function Test-ReparsePoint {
-    param([string]$Path)
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($item) {
-        return ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-    }
-    return $false
-}
-
-function Remove-ReparsePointSafe {
-    param([string]$Path)
-    if (Test-ReparsePoint -Path $Path) {
-        $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rmdir `"$Path`"" -NoNewWindow -Wait -PassThru 2>$null
-        return -not (Test-Path -LiteralPath $Path)
-    }
-    return $false
 }
 
 # ============================================================================
@@ -1659,16 +1311,16 @@ function Invoke-BootTimeDelete {
     Write-Console "Target: $Path" -Type "Normal"
     
     try {
-        $success = [BootDelete]::ScheduleDelete($Path)
+        $bootDeleteResult = Register-BootTimeDelete -Path $Path
         
-        if ($success) {
+        if ($bootDeleteResult.Success) {
             Write-Console "Scheduled for deletion on next reboot" -Type "Success"
             Write-Console "The file will be deleted by Session Manager before services start" -Type "Info"
             Write-Log "Boot-time deletion scheduled: $Path" -Level "SUCCESS"
             return $true
         }
         else {
-            Write-Console "MoveFileEx API call failed, trying registry fallback..." -Type "Warning"
+            Write-Console "MoveFileEx API call failed ($($bootDeleteResult.Error)), trying registry fallback..." -Type "Warning"
             
             $regPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager"
             $existing = @()
@@ -1965,52 +1617,6 @@ function Invoke-UnblockRecursive {
 # ============================================================================
 # FILESYSTEM REPAIR
 # ============================================================================
-function Get-DriveSmartHealth {
-    param([string]$Drive)
-
-    try {
-        $driveLetter = $Drive.TrimEnd(':')
-        $partition = Get-Partition -DriveLetter $driveLetter -ErrorAction Stop | Select-Object -First 1
-        $disk = Get-CimInstance -ClassName Win32_DiskDrive -Filter "Index = $($partition.DiskNumber)" -ErrorAction Stop
-        if (-not $disk -or [string]::IsNullOrWhiteSpace($disk.PNPDeviceID)) {
-            throw "The physical disk could not be resolved"
-        }
-
-        $statuses = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
-        $pnpDeviceId = [string]$disk.PNPDeviceID
-        $status = $statuses | Where-Object {
-            $_.InstanceName -and $_.InstanceName.StartsWith(
-                $pnpDeviceId,
-                [System.StringComparison]::OrdinalIgnoreCase)
-        } | Select-Object -First 1
-
-        if (-not $status) {
-            return [PSCustomObject]@{
-                Available      = $false
-                PredictFailure = $false
-                Reason         = 0
-                DiskName       = $disk.Model
-            }
-        }
-
-        return [PSCustomObject]@{
-            Available      = $true
-            PredictFailure = [bool]$status.PredictFailure
-            Reason         = [uint32]$status.Reason
-            DiskName       = $disk.Model
-        }
-    }
-    catch {
-        Write-Log "SMART pre-repair query failed for $Drive : $_" -Level "WARN"
-        return [PSCustomObject]@{
-            Available      = $false
-            PredictFailure = $false
-            Reason         = 0
-            DiskName       = "Unknown"
-        }
-    }
-}
-
 function Confirm-RepairDriveHealth {
     param(
         [string]$Drive,
@@ -2054,11 +1660,10 @@ function Get-VolumeCorruptionHealth {
     Write-Console "=== Quick Volume Health Check: $Drive ===" -Type "Info"
     Set-Status "Checking volume corruption count..."
 
-    try {
-        $driveLetter = $Drive.TrimEnd(':')
-        $count = [uint32](Get-VolumeCorruptionCount -DriveLetter $driveLetter -ErrorAction Stop)
-        if ($count -gt 0) {
-            Write-Console "$Drive has $count recorded filesystem corruption(s)" -Type "Warning"
+    $health = Get-VolumeCorruptionRecord -Drive $Drive
+    if ($health.Available) {
+        if ($health.CorruptionCount -gt 0) {
+            Write-Console "$Drive has $($health.CorruptionCount) recorded filesystem corruption(s)" -Type "Warning"
             Write-Console "Run CHKDSK /scan to inspect the volume before repair" -Type "Info"
         }
         else {
@@ -2066,58 +1671,31 @@ function Get-VolumeCorruptionHealth {
         }
 
         Set-Status "Quick health check complete"
-        return [PSCustomObject]@{ Drive = $Drive; CorruptionCount = $count; Available = $true }
+        return $health
     }
-    catch {
-        Write-Console "Quick health check unavailable: $_" -Type "Warning"
-        Set-Status "Quick health check unavailable"
-        Write-Log "Volume corruption count failed for $Drive : $_" -Level "WARN"
-        return [PSCustomObject]@{ Drive = $Drive; CorruptionCount = 0; Available = $false }
-    }
+
+    Write-Console "Quick health check unavailable: $($health.Error)" -Type "Warning"
+    Set-Status "Quick health check unavailable"
+    Write-Log "Volume corruption count failed for $Drive : $($health.Error)" -Level "WARN"
+    return $health
 }
 
 function Invoke-ChkdskWithProgress {
-    param([string]$Drive, [string]$Arguments)
+    param(
+        [string]$Drive,
+        [ValidateSet('ChkdskScan', 'ChkdskFix', 'ChkdskFull', 'ChkdskSpotfix')]
+        [string]$Operation
+    )
 
-    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pinfo.FileName = "chkdsk.exe"
-    $pinfo.Arguments = "$Drive $Arguments"
-    $pinfo.UseShellExecute = $false
-    $pinfo.CreateNoWindow = $true
-    $pinfo.RedirectStandardOutput = $true
-    $pinfo.RedirectStandardError = $true
+    $repairResult = Invoke-PathForgeRepair -Operation $Operation -Drive $Drive `
+        -OutputAction { param($line) Write-Console "  $line" -Type "Normal" } `
+        -ErrorCallback { param($line) Write-Console "  $line" -Type "Error" } `
+        -ProgressCallback { param($percent, $display) $null = $display; Set-Progress -Value $percent -Maximum 100 } `
+        -ProcessAction { param($process) $Script:ActiveProcess = $process } `
+        -PumpAction { [System.Windows.Forms.Application]::DoEvents() }
 
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $pinfo
-
-    $outputHandler = {
-        if ($EventArgs.Data) {
-            $line = $EventArgs.Data.Trim()
-            if ($line) {
-                if ($line -match "(\d+)\s*percent") {
-                    Set-Progress -Value ([int]$matches[1]) -Maximum 100
-                }
-                Write-Console "  $line" -Type "Normal"
-            }
-        }
-    }
-
-    $process.EnableRaisingEvents = $true
-    $eventJob = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler
-
-    $null = $process.Start()
-    $Script:ActiveProcess = $process
-    $process.BeginOutputReadLine()
-
-    while (-not $process.HasExited) {
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Milliseconds 100
-    }
-
-    Unregister-Event -SourceIdentifier $eventJob.Name -ErrorAction SilentlyContinue
-    Remove-Job -Job $eventJob -Force -ErrorAction SilentlyContinue
-    $Script:ActiveProcess = $null
     Set-Progress -Value 0
+    return $repairResult
 }
 
 function Invoke-ChkdskScan {
@@ -2129,10 +1707,15 @@ function Invoke-ChkdskScan {
     Write-Console "" -Type "Normal"
     Set-Status "CHKDSK running..."
     
-    Invoke-ChkdskWithProgress -Drive $Drive -Arguments "/scan"
+    $repairResult = Invoke-ChkdskWithProgress -Drive $Drive -Operation ChkdskScan
     
     Write-Console "" -Type "Normal"
-    Write-Console "CHKDSK /scan complete" -Type "Success"
+    if ($repairResult.Success) {
+        Write-Console "CHKDSK /scan complete" -Type "Success"
+    }
+    else {
+        Write-Console "CHKDSK /scan failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+    }
     Exit-Operation
 }
 
@@ -2161,10 +1744,15 @@ function Invoke-ChkdskFix {
         Write-Console "" -Type "Normal"
         Set-Status "CHKDSK running..."
         
-        Invoke-ChkdskWithProgress -Drive $Drive -Arguments "/F /X"
+        $repairResult = Invoke-ChkdskWithProgress -Drive $Drive -Operation ChkdskFix
         
         Write-Console "" -Type "Normal"
-        Write-Console "CHKDSK /F complete" -Type "Success"
+        if ($repairResult.Success) {
+            Write-Console "CHKDSK /F complete" -Type "Success"
+        }
+        else {
+            Write-Console "CHKDSK /F failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+        }
     }
     Exit-Operation
 }
@@ -2180,12 +1768,15 @@ function Invoke-ChkdskFull {
     Write-Console "" -Type "Normal"
     Set-Status "CHKDSK /R running (this takes hours)..."
     
-    $chkdskArgs = if ($Drive -eq "C:") { "/R" } else { "/R /X" }
-
-    Invoke-ChkdskWithProgress -Drive $Drive -Arguments $chkdskArgs
+    $repairResult = Invoke-ChkdskWithProgress -Drive $Drive -Operation ChkdskFull
     
     Write-Console "" -Type "Normal"
-    Write-Console "CHKDSK /R complete" -Type "Success"
+    if ($repairResult.Success) {
+        Write-Console "CHKDSK /R complete" -Type "Success"
+    }
+    else {
+        Write-Console "CHKDSK /R failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+    }
     Exit-Operation
 }
 
@@ -2198,10 +1789,15 @@ function Invoke-ChkdskSpotfix {
     Write-Console "" -Type "Normal"
     Set-Status "CHKDSK running..."
     
-    Invoke-ChkdskWithProgress -Drive $Drive -Arguments "/spotfix"
+    $repairResult = Invoke-ChkdskWithProgress -Drive $Drive -Operation ChkdskSpotfix
     
     Write-Console "" -Type "Normal"
-    Write-Console "CHKDSK /spotfix complete" -Type "Success"
+    if ($repairResult.Success) {
+        Write-Console "CHKDSK /spotfix complete" -Type "Success"
+    }
+    else {
+        Write-Console "CHKDSK /spotfix failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+    }
     Exit-Operation
 }
 
@@ -2214,46 +1810,22 @@ function Invoke-SFCScan {
     Write-Console "" -Type "Normal"
     Set-Status "SFC running..."
     
-    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pinfo.FileName = "sfc.exe"
-    $pinfo.Arguments = "/scannow"
-    $pinfo.UseShellExecute = $false
-    $pinfo.CreateNoWindow = $true
-    $pinfo.RedirectStandardOutput = $true
-    
-    $process = [System.Diagnostics.Process]::Start($pinfo)
-    $Script:ActiveProcess = $process
+    $repairResult = Invoke-PathForgeRepair -Operation SfcScan `
+        -OutputAction { param($line) if ($line.Length -gt 5) { Write-Console "  $line" -Type "Normal" } } `
+        -ErrorCallback { param($line) Write-Console "  $line" -Type "Error" } `
+        -ProgressCallback { param($percent, $display) Set-Progress -Value $percent -Maximum 100; Set-Status "SFC running... $display" } `
+        -ProcessAction { param($process) $Script:ActiveProcess = $process } `
+        -PumpAction { [System.Windows.Forms.Application]::DoEvents() }
 
-    while (-not $process.HasExited) {
-        $line = $process.StandardOutput.ReadLine()
-        if ($line) {
-            $line = $line.Trim()
-            if ($line -match "(\d+)%") {
-                Set-Progress -Value ([int]$matches[1]) -Maximum 100
-                Set-Status "SFC running... $($matches[0])"
-            }
-            if ($line -and $line.Length -gt 5) {
-                Write-Console "  $line" -Type "Normal"
-            }
-        }
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-
-    $Script:ActiveProcess = $null
-    $remaining = $process.StandardOutput.ReadToEnd()
-    $sfcFailed = $false
-    foreach ($line in $remaining.Split("`n")) {
-        $line = $line.Trim()
-        if ($line.Length -gt 5) {
-            Write-Console "  $line" -Type "Normal"
-            if ($line -match "unable to fix|could not.*repair|corrupt.*files" -and $line -notmatch "no integrity") {
-                $sfcFailed = $true
-            }
-        }
-    }
+    $sfcFailed = @($repairResult.Output | Where-Object {
+            $_ -match 'unable to fix|could not.*repair|found corrupt files but was unable'
+        }).Count -gt 0
 
     Write-Console "" -Type "Normal"
-    if ($sfcFailed) {
+    if (-not $repairResult.Success) {
+        Write-Console "SFC failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+    }
+    elseif ($sfcFailed) {
         Write-Console "SFC found issues it could not repair" -Type "Warning"
         Write-Console "" -Type "Normal"
         Write-Console "NEXT STEPS:" -Type "Info"
@@ -2279,66 +1851,83 @@ function Invoke-DISMRestore {
     Write-Console "" -Type "Normal"
     Set-Status "DISM running..."
     
-    $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-    $pinfo.FileName = "DISM.exe"
-    $pinfo.Arguments = "/Online /Cleanup-Image /RestoreHealth"
-    $pinfo.UseShellExecute = $false
-    $pinfo.CreateNoWindow = $true
-    $pinfo.RedirectStandardOutput = $true
-    
-    $process = [System.Diagnostics.Process]::Start($pinfo)
-    $Script:ActiveProcess = $process
-    $lastProgressTime = Get-Date
-    $lastPct = -1
-    $stallWarned = $false
-
-    while (-not $process.HasExited) {
-        $line = $process.StandardOutput.ReadLine()
-        if ($line) {
-            $line = $line.Trim()
-            if ($line -match "(\d+)\.(\d+)%") {
-                $currentPct = [int]$matches[1]
-                if ($currentPct -ne $lastPct) {
-                    $lastPct = $currentPct
-                    $lastProgressTime = Get-Date
-                    $stallWarned = $false
-                }
-                Set-Progress -Value $currentPct -Maximum 100
-                Set-Status "DISM running... $($matches[0])"
+    $repairResult = Invoke-PathForgeRepair -Operation DismRestore `
+        -OutputAction { param($line) if ($line.Length -gt 3 -and $line -notmatch '^\[=+\s*\]') { Write-Console "  $line" -Type "Normal" } } `
+        -ErrorCallback { param($line) Write-Console "  $line" -Type "Error" } `
+        -ProgressCallback { param($percent, $display) Set-Progress -Value $percent -Maximum 100; Set-Status "DISM running... $display" } `
+        -ProcessAction { param($process) $Script:ActiveProcess = $process } `
+        -PumpAction { [System.Windows.Forms.Application]::DoEvents() } `
+        -StallAction {
+            param($lastPercent)
+            if ($lastPercent -ge 60 -and $lastPercent -le 65) {
+                Write-Console "  [NORMAL] DISM often stalls near 62% on Win11 24H2 -- this is a known behavior, not a hang" -Type "Info"
             }
-            if ($line.Length -gt 3 -and $line -notmatch "^\[=+\s*\]") {
-                Write-Console "  $line" -Type "Normal"
+            else {
+                Write-Console "  [NORMAL] DISM is still working -- progress may pause for several minutes at certain stages" -Type "Info"
             }
+            Write-Console "  Do NOT cancel unless you are certain the process has stopped" -Type "Warning"
         }
-        else {
-            $stallSeconds = ((Get-Date) - $lastProgressTime).TotalSeconds
-            if ($stallSeconds -gt 60 -and -not $stallWarned) {
-                $stallWarned = $true
-                if ($lastPct -ge 60 -and $lastPct -le 65) {
-                    Write-Console "  [NORMAL] DISM often stalls near 62% on Win11 24H2 -- this is a known behavior, not a hang" -Type "Info"
-                }
-                else {
-                    Write-Console "  [NORMAL] DISM is still working -- progress may pause for several minutes at certain stages" -Type "Info"
-                }
-                Write-Console "  Do NOT cancel unless you are certain the process has stopped" -Type "Warning"
-            }
-        }
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-
-    $Script:ActiveProcess = $null
-    $remaining = $process.StandardOutput.ReadToEnd()
-    foreach ($line in $remaining.Split("`n")) {
-        $line = $line.Trim()
-        if ($line.Length -gt 5 -and $line -notmatch "^\[=+\s*\]") {
-            Write-Console "  $line" -Type "Normal"
-        }
-    }
 
     Write-Console "" -Type "Normal"
-    Write-Console "DISM RestoreHealth complete" -Type "Success"
+    if ($repairResult.Success) {
+        Write-Console "DISM RestoreHealth complete" -Type "Success"
+    }
+    else {
+        Write-Console "DISM failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+    }
     Write-Console "Log file: %WinDir%\Logs\DISM\dism.log" -Type "Info"
     Exit-Operation
+}
+
+function Invoke-FullSystemRepair {
+    if (-not (Enter-Operation "Full System Repair")) { return }
+
+    try {
+        if ([System.Windows.Forms.MessageBox]::Show(
+                "Run complete repair sequence?`n`n1. DISM /RestoreHealth (15-30 min)`n2. SFC /scannow (10-15 min)`n3. CHKDSK /scan (5-10 min)`n`nTotal time: 30-60 minutes",
+                "Full System Repair", 4, 32) -ne 6) {
+            return
+        }
+
+        Write-Console "=== FULL SYSTEM REPAIR SEQUENCE ===" -Type "Info"
+        Write-Console "" -Type "Normal"
+
+        $steps = @(
+            @{Operation = 'DismRestore'; Drive = $null; Label = 'DISM /RestoreHealth' },
+            @{Operation = 'SfcScan'; Drive = $null; Label = 'SFC /scannow' },
+            @{Operation = 'ChkdskScan'; Drive = 'C:'; Label = 'CHKDSK /scan on C:' }
+        )
+
+        for ($index = 0; $index -lt $steps.Count; $index++) {
+            $step = $steps[$index]
+            $stepNumber = $index + 1
+            Write-Console "Step $stepNumber/$($steps.Count): $($step.Label)" -Type "Info"
+            Set-Status "Full Repair: $($step.Label) running..."
+
+            $repairResult = Invoke-PathForgeRepair -Operation $step.Operation -Drive $step.Drive `
+                -OutputAction { param($line) if ($line.Length -gt 3 -and $line -notmatch '^\[=+\s*\]') { Write-Console "  $line" -Type "Normal" } } `
+                -ErrorCallback { param($line) Write-Console "  $line" -Type "Error" } `
+                -ProgressCallback { param($percent, $display) Set-Progress -Value $percent -Maximum 100; Set-Status "Full Repair: $($step.Label) $display" } `
+                -ProcessAction { param($process) $Script:ActiveProcess = $process } `
+                -PumpAction { [System.Windows.Forms.Application]::DoEvents() } `
+                -StallAction { param($lastPercent) $null = $lastPercent; Write-Console "  The repair is still working -- progress can pause for several minutes" -Type "Info" }
+
+            if (-not $repairResult.Success) {
+                Write-Console "$($step.Label) failed (exit code $($repairResult.ExitCode)): $($repairResult.Error)" -Type "Error"
+                Write-Console "Full repair sequence stopped before the next step" -Type "Warning"
+                return
+            }
+
+            Write-Console "  $($step.Label) complete" -Type "Success"
+            Write-Console "" -Type "Normal"
+        }
+
+        Write-Console "=== FULL REPAIR SEQUENCE COMPLETE ===" -Type "Success"
+        Write-Console "Recommend: Reboot and run SFC again to verify" -Type "Info"
+    }
+    finally {
+        Exit-Operation
+    }
 }
 
 function Get-DirtyBitStatus {
@@ -2489,80 +2078,129 @@ function Set-NTFSSelfHealing {
 function Get-DriveHealth {
     Write-Console "=== Comprehensive Drive Health Report ===" -Type "Info"
     Write-Console "" -Type "Normal"
+
+    $report = Get-PathForgeDriveHealth
     
     # Physical disks
     Write-Console "--- Physical Disks ---" -Type "Info"
-    Get-PhysicalDisk | ForEach-Object {
-        $health = $_.HealthStatus
+    foreach ($disk in $report.PhysicalDisks) {
+        $health = $disk.HealthStatus
         $type = switch ($health) {
             "Healthy" { "Success" }
             "Warning" { "Warning" }
             default { "Error" }
         }
-        Write-Console "  $($_.FriendlyName)" -Type "Info"
-        Write-Console "    Model: $($_.Model)" -Type "Normal"
-        Write-Console "    Media: $($_.MediaType)" -Type "Normal"
-        Write-Console "    Size: $([math]::Round($_.Size/1GB)) GB" -Type "Normal"
+        Write-Console "  $($disk.FriendlyName)" -Type "Info"
+        Write-Console "    Model: $($disk.Model)" -Type "Normal"
+        Write-Console "    Media: $($disk.MediaType)" -Type "Normal"
+        Write-Console "    Size: $([math]::Round($disk.Size/1GB)) GB" -Type "Normal"
         Write-Console "    Health: $health" -Type $type
-        Write-Console "    Status: $($_.OperationalStatus)" -Type "Normal"
+        Write-Console "    Status: $($disk.OperationalStatus)" -Type "Normal"
     }
     
     Write-Console "" -Type "Normal"
     Write-Console "--- Volumes ---" -Type "Info"
-    Get-Volume | Where-Object { $_.DriveLetter } | ForEach-Object {
-        $pctFree = if ($_.Size -gt 0) { [math]::Round(($_.SizeRemaining / $_.Size) * 100, 1) } else { 0 }
+    foreach ($volume in $report.Volumes) {
+        $pctFree = if ($volume.Size -gt 0) { [math]::Round(($volume.SizeRemaining / $volume.Size) * 100, 1) } else { 0 }
         $freeType = if ($pctFree -lt 10) { "Error" } elseif ($pctFree -lt 20) { "Warning" } else { "Normal" }
         
-        Write-Console "  $($_.DriveLetter): $($_.FileSystemLabel)" -Type "Info"
-        Write-Console "    FileSystem: $($_.FileSystem)" -Type "Normal"
-        Write-Console "    Size: $([math]::Round($_.Size/1GB, 1)) GB" -Type "Normal"
-        Write-Console "    Free: $([math]::Round($_.SizeRemaining/1GB, 1)) GB ($pctFree%)" -Type $freeType
-        Write-Console "    Health: $($_.HealthStatus)" -Type "Normal"
+        Write-Console "  $($volume.DriveLetter): $($volume.FileSystemLabel)" -Type "Info"
+        Write-Console "    FileSystem: $($volume.FileSystem)" -Type "Normal"
+        Write-Console "    Size: $([math]::Round($volume.Size/1GB, 1)) GB" -Type "Normal"
+        Write-Console "    Free: $([math]::Round($volume.SizeRemaining/1GB, 1)) GB ($pctFree%)" -Type $freeType
+        Write-Console "    Health: $($volume.HealthStatus)" -Type "Normal"
     }
     
     Write-Console "" -Type "Normal"
     Write-Console "--- SMART Failure Prediction ---" -Type "Info"
-    try {
-        $smart = Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop
-        if ($smart) {
-            foreach ($s in $smart) {
-                $name = ($s.InstanceName -replace '_0$', '' -split '\\')[-1]
-                if ($s.PredictFailure) {
-                    Write-Console "  $name : FAILURE PREDICTED!" -Type "Error"
-                    Write-Console "    >>> BACKUP YOUR DATA IMMEDIATELY! <<<" -Type "Error"
-                }
-                else {
-                    Write-Console "  $name : No failure predicted" -Type "Success"
-                }
+    if ($report.SmartStatuses.Count -eq 0) {
+        Write-Console "  SMART data not available via WMI" -Type "Warning"
+    }
+    else {
+        foreach ($smartStatus in $report.SmartStatuses) {
+            $name = ($smartStatus.InstanceName -replace '_0$', '' -split '\\')[-1]
+            if ($smartStatus.PredictFailure) {
+                Write-Console "  $name : FAILURE PREDICTED!" -Type "Error"
+                Write-Console "    >>> BACKUP YOUR DATA IMMEDIATELY! <<<" -Type "Error"
+            }
+            else {
+                Write-Console "  $name : No failure predicted" -Type "Success"
             }
         }
-    }
-    catch {
-        Write-Console "  SMART data not available via WMI" -Type "Warning"
     }
     
     Write-Console "" -Type "Normal"
     Write-Console "--- Storage Reliability Counters ---" -Type "Info"
-    try {
-        Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction SilentlyContinue | ForEach-Object {
-            Write-Console "  Device: $($_.DeviceId)" -Type "Info"
-            Write-Console "    Read Errors: $($_.ReadErrorsTotal) (Uncorrected: $($_.ReadErrorsUncorrected))" -Type $(if ($_.ReadErrorsUncorrected -gt 0) { "Error" } elseif ($_.ReadErrorsTotal -gt 0) { "Warning" } else { "Normal" })
-            Write-Console "    Write Errors: $($_.WriteErrorsTotal) (Uncorrected: $($_.WriteErrorsUncorrected))" -Type $(if ($_.WriteErrorsUncorrected -gt 0) { "Error" } elseif ($_.WriteErrorsTotal -gt 0) { "Warning" } else { "Normal" })
-            $tempC = $_.Temperature
+    if ($report.ReliabilityCounters.Count -eq 0) {
+        Write-Console "  Reliability counters not available" -Type "Warning"
+    }
+    else {
+        foreach ($counter in $report.ReliabilityCounters) {
+            Write-Console "  Device: $($counter.DeviceId)" -Type "Info"
+            Write-Console "    Read Errors: $($counter.ReadErrorsTotal) (Uncorrected: $($counter.ReadErrorsUncorrected))" -Type $(if ($counter.ReadErrorsUncorrected -gt 0) { "Error" } elseif ($counter.ReadErrorsTotal -gt 0) { "Warning" } else { "Normal" })
+            Write-Console "    Write Errors: $($counter.WriteErrorsTotal) (Uncorrected: $($counter.WriteErrorsUncorrected))" -Type $(if ($counter.WriteErrorsUncorrected -gt 0) { "Error" } elseif ($counter.WriteErrorsTotal -gt 0) { "Warning" } else { "Normal" })
+            $tempC = $counter.Temperature
             Write-Console "    Temperature: ${tempC}C" -Type $(if ($tempC -gt 55) { "Error" } elseif ($tempC -gt 45) { "Warning" } else { "Normal" })
-            $wearPct = $_.Wear
+            $wearPct = $counter.Wear
             Write-Console "    Wear: ${wearPct}%" -Type $(if ($wearPct -gt 80) { "Error" } elseif ($wearPct -gt 50) { "Warning" } else { "Normal" })
-            Write-Console "    Power-On Hours: $($_.PowerOnHours)" -Type "Normal"
-            if ($_.ReadLatencyMax -gt 0) {
-                Write-Console "    Max Read Latency: $($_.ReadLatencyMax) ms" -Type $(if ($_.ReadLatencyMax -gt 10000) { "Error" } elseif ($_.ReadLatencyMax -gt 1000) { "Warning" } else { "Normal" })
+            Write-Console "    Power-On Hours: $($counter.PowerOnHours)" -Type "Normal"
+            if ($counter.ReadLatencyMax -gt 0) {
+                Write-Console "    Max Read Latency: $($counter.ReadLatencyMax) ms" -Type $(if ($counter.ReadLatencyMax -gt 10000) { "Error" } elseif ($counter.ReadLatencyMax -gt 1000) { "Warning" } else { "Normal" })
             }
-            if ($_.WriteLatencyMax -gt 0) {
-                Write-Console "    Max Write Latency: $($_.WriteLatencyMax) ms" -Type $(if ($_.WriteLatencyMax -gt 10000) { "Error" } elseif ($_.WriteLatencyMax -gt 1000) { "Warning" } else { "Normal" })
+            if ($counter.WriteLatencyMax -gt 0) {
+                Write-Console "    Max Write Latency: $($counter.WriteLatencyMax) ms" -Type $(if ($counter.WriteLatencyMax -gt 10000) { "Error" } elseif ($counter.WriteLatencyMax -gt 1000) { "Warning" } else { "Normal" })
             }
         }
     }
-    catch {
-        Write-Console "  Reliability counters not available" -Type "Warning"
+}
+
+function Get-SmartStatus {
+    Write-Console "=== SMART Failure Prediction ===" -Type "Info"
+    Write-Console "" -Type "Normal"
+
+    $result = Get-PathForgeSmartStatus
+    if (-not $result.Success) {
+        Write-Console "  Failed to query SMART: $($result.Error)" -Type "Error"
+        return
+    }
+    if ($result.Items.Count -eq 0) {
+        Write-Console "  SMART data not available via WMI" -Type "Warning"
+        return
+    }
+
+    foreach ($status in $result.Items) {
+        $name = ($status.InstanceName -replace '_0$', '' -split '\\')[-1]
+        if ($status.PredictFailure) {
+            Write-Console "  $name : FAILURE PREDICTED!" -Type "Error"
+            Write-Console "    Reason Code: $($status.Reason)" -Type "Error"
+            Write-Console "    >>> BACKUP YOUR DATA IMMEDIATELY! <<<" -Type "Error"
+        }
+        else {
+            Write-Console "  $name : No failure predicted" -Type "Success"
+        }
+    }
+}
+
+function Get-ReliabilityCounter {
+    Write-Console "=== Storage Reliability Counters ===" -Type "Info"
+    Write-Console "" -Type "Normal"
+
+    $result = Get-PathForgeReliabilityCounter
+    if (-not $result.Success) {
+        Write-Console "  Reliability counters not available: $($result.Error)" -Type "Warning"
+        return
+    }
+
+    foreach ($counter in $result.Items) {
+        Write-Console "  Device ID: $($counter.DeviceId)" -Type "Info"
+        Write-Console "    Read Errors (Total): $($counter.ReadErrorsTotal)" -Type $(if ($counter.ReadErrorsTotal -gt 0) { "Warning" } else { "Normal" })
+        Write-Console "    Read Errors (Corrected): $($counter.ReadErrorsCorrected)" -Type "Normal"
+        Write-Console "    Read Errors (Uncorrected): $($counter.ReadErrorsUncorrected)" -Type $(if ($counter.ReadErrorsUncorrected -gt 0) { "Error" } else { "Normal" })
+        Write-Console "    Write Errors (Total): $($counter.WriteErrorsTotal)" -Type $(if ($counter.WriteErrorsTotal -gt 0) { "Warning" } else { "Normal" })
+        Write-Console "    Temperature: $($counter.Temperature) C" -Type $(if ($counter.Temperature -gt 50) { "Warning" } else { "Normal" })
+        Write-Console "    Wear: $($counter.Wear)" -Type $(if ($counter.Wear -gt 80) { "Warning" } else { "Normal" })
+        Write-Console "    Power On Hours: $($counter.PowerOnHours)" -Type "Normal"
+        Write-Console "" -Type "Normal"
     }
 }
 
@@ -2571,29 +2209,24 @@ function Get-TRIMStatus {
     Write-Console "TRIM should be ENABLED for SSDs" -Type "Normal"
     Write-Console "" -Type "Normal"
     
-    try {
-        $result = fsutil behavior query DisableDeleteNotify 2>&1
-        
-        foreach ($line in ($result -split "`n")) {
-            if ($line -match "DisableDeleteNotify\s*=\s*(\d)") {
-                $fs = $line -replace "DisableDeleteNotify.*", "" 
-                $fs = $fs.Trim()
-                $value = $matches[1]
-                
-                if ($value -eq "0") {
-                    Write-Console "  $fs TRIM: ENABLED (recommended)" -Type "Success"
-                }
-                else {
-                    Write-Console "  $fs TRIM: DISABLED" -Type "Warning"
-                }
+    $status = Get-PathForgeTrimStatus
+    if (-not $status.Success) {
+        Write-Console "Could not query TRIM status: $($status.Error)" -Type "Error"
+        return
+    }
+
+    foreach ($item in $status.Items) {
+        if ($null -ne $item.Enabled) {
+            if ($item.Enabled) {
+                Write-Console "  $($item.FileSystem) TRIM: ENABLED (recommended)" -Type "Success"
             }
-            elseif ($line.Trim()) {
-                Write-Console "  $($line.Trim())" -Type "Normal"
+            else {
+                Write-Console "  $($item.FileSystem) TRIM: DISABLED" -Type "Warning"
             }
         }
-    }
-    catch {
-        Write-Console "Could not query TRIM status: $_" -Type "Error"
+        else {
+            Write-Console "  $($item.Raw)" -Type "Normal"
+        }
     }
 }
 
@@ -2601,33 +2234,12 @@ function Get-FilesystemEvents {
     Write-Console "=== Filesystem Event Log Analysis (Last 7 Days) ===" -Type "Info"
     Write-Console "" -Type "Normal"
     
-    $criticalEvents = @(
-        @{Id = 55; Desc = "Filesystem structure corrupt" },
-        @{Id = 50; Desc = "Delayed write failed (data loss)" },
-        @{Id = 98; Desc = "Volume needs offline CHKDSK" },
-        @{Id = 129; Desc = "Reset to device issued (timeout)" },
-        @{Id = 153; Desc = "Disk retry occurred" },
-        @{Id = 157; Desc = "Disk surprise removed" }
-    )
-    
-    $foundEvents = @()
-    
     Write-Console "Searching for critical events..." -Type "Progress"
-    
-    foreach ($eventDef in $criticalEvents) {
-        try {
-            $events = Get-WinEvent -FilterHashtable @{
-                LogName   = 'System'
-                Id        = $eventDef.Id
-                StartTime = (Get-Date).AddDays(-7)
-            } -MaxEvents 10 -ErrorAction SilentlyContinue
-            
-            if ($events) {
-                $foundEvents += $events
-                Write-Console "  Event ID $($eventDef.Id): $($events.Count) occurrence(s) - $($eventDef.Desc)" -Type "Warning"
-            }
-        }
-        catch { Write-Log "Event log query failed for ID $($eventDef.Id): $_" -Level "WARN" }
+
+    $foundEvents = @(Get-PathForgeFilesystemEvent -Days 7 -MaxEventsPerId 10)
+    foreach ($eventGroup in ($foundEvents | Group-Object Id)) {
+        $description = $eventGroup.Group[0].Description
+        Write-Console "  Event ID $($eventGroup.Name): $($eventGroup.Count) occurrence(s) - $description" -Type "Warning"
     }
     
     if ($foundEvents.Count -eq 0) {
@@ -3397,69 +3009,7 @@ function Build-RepairPage {
     $card8 = New-ToolCard -Title "SFC Scan" -Desc "Repairs protected system files (run AFTER DISM)" -BtnText "SFC /scannow" -X 320 -Y $y -OnClick { Invoke-SFCScan }
     $null = $page.Controls.Add($card8)
     
-    $card9 = New-ToolCard -Title "Full System Repair" -Desc "DISM + SFC + CHKDSK in correct order (30-60 min)" -BtnText "Run All" -X 610 -Y $y -OnClick {
-        if (-not (Enter-Operation "Full System Repair")) { return }
-        if ([System.Windows.Forms.MessageBox]::Show(
-            "Run complete repair sequence?`n`n1. DISM /RestoreHealth (15-30 min)`n2. SFC /scannow (10-15 min)`n3. CHKDSK /scan (5-10 min)`n`nTotal time: 30-60 minutes",
-            "Full System Repair", 4, 32) -ne 6) {
-            Exit-Operation
-            return
-        }
-        Write-Console "=== FULL SYSTEM REPAIR SEQUENCE ===" -Type "Info"
-        Write-Console "" -Type "Normal"
-        Write-Console "Step 1/3: DISM /RestoreHealth" -Type "Info"
-        Set-Status "Full Repair: DISM running..."
-        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo.FileName = "DISM.exe"
-        $pinfo.Arguments = "/Online /Cleanup-Image /RestoreHealth"
-        $pinfo.UseShellExecute = $false
-        $pinfo.CreateNoWindow = $true
-        $pinfo.RedirectStandardOutput = $true
-        $dismProc = [System.Diagnostics.Process]::Start($pinfo)
-        $Script:ActiveProcess = $dismProc
-        while (-not $dismProc.HasExited) {
-            $line = $dismProc.StandardOutput.ReadLine()
-            if ($line) {
-                $line = $line.Trim()
-                if ($line -match "(\d+)\.(\d+)%") { Set-Progress -Value ([int]$matches[1]) -Maximum 100 }
-                if ($line.Length -gt 3 -and $line -notmatch "^\[=+\s*\]") { Write-Console "  $line" -Type "Normal" }
-            }
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-        $Script:ActiveProcess = $null
-        Write-Console "  DISM complete" -Type "Success"
-        Write-Console "" -Type "Normal"
-        Write-Console "Step 2/3: SFC /scannow" -Type "Info"
-        Set-Status "Full Repair: SFC running..."
-        $pinfo2 = New-Object System.Diagnostics.ProcessStartInfo
-        $pinfo2.FileName = "sfc.exe"
-        $pinfo2.Arguments = "/scannow"
-        $pinfo2.UseShellExecute = $false
-        $pinfo2.CreateNoWindow = $true
-        $pinfo2.RedirectStandardOutput = $true
-        $sfcProc = [System.Diagnostics.Process]::Start($pinfo2)
-        $Script:ActiveProcess = $sfcProc
-        while (-not $sfcProc.HasExited) {
-            $line = $sfcProc.StandardOutput.ReadLine()
-            if ($line) {
-                $line = $line.Trim()
-                if ($line -match "(\d+)%") { Set-Progress -Value ([int]$matches[1]) -Maximum 100 }
-                if ($line.Length -gt 5) { Write-Console "  $line" -Type "Normal" }
-            }
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-        $Script:ActiveProcess = $null
-        Write-Console "  SFC complete" -Type "Success"
-        Write-Console "" -Type "Normal"
-        Write-Console "Step 3/3: CHKDSK /scan on C:" -Type "Info"
-        Set-Status "Full Repair: CHKDSK running..."
-        Invoke-ChkdskWithProgress -Drive "C:" -Arguments "/scan"
-        Write-Console "  CHKDSK complete" -Type "Success"
-        Write-Console "" -Type "Normal"
-        Write-Console "=== FULL REPAIR SEQUENCE COMPLETE ===" -Type "Success"
-        Write-Console "Recommend: Reboot and run SFC again to verify" -Type "Info"
-        Exit-Operation
-    }
+    $card9 = New-ToolCard -Title "Full System Repair" -Desc "DISM + SFC + CHKDSK in correct order (30-60 min)" -BtnText "Run All" -X 610 -Y $y -OnClick { Invoke-FullSystemRepair }
     $null = $page.Controls.Add($card9)
     $y += 130
     
@@ -3598,32 +3148,7 @@ function Build-DiagnosticsPage {
     $card1 = New-ToolCard -Title "Drive Health Report" -Desc "Comprehensive: physical disks, volumes, SMART, reliability" -BtnText "Generate Report" -X 30 -Y $y -OnClick { Get-DriveHealth }
     $null = $page.Controls.Add($card1)
     
-    $card2 = New-ToolCard -Title "SMART Check" -Desc "FailurePredictStatus - early warning of drive failure" -BtnText "Check SMART" -X 320 -Y $y -OnClick {
-        Write-Console "=== SMART Failure Prediction ===" -Type "Info"
-        Write-Console "" -Type "Normal"
-        try {
-            $smart = Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop
-            if ($smart) {
-                foreach ($s in $smart) {
-                    $name = ($s.InstanceName -replace '_0$', '' -split '\\')[-1]
-                    if ($s.PredictFailure) {
-                        Write-Console "  $name : FAILURE PREDICTED!" -Type "Error"
-                        Write-Console "    Reason Code: $($s.Reason)" -Type "Error"
-                        Write-Console "    >>> BACKUP YOUR DATA IMMEDIATELY! <<<" -Type "Error"
-                    }
-                    else {
-                        Write-Console "  $name : No failure predicted" -Type "Success"
-                    }
-                }
-            }
-            else {
-                Write-Console "  SMART data not available via WMI" -Type "Warning"
-            }
-        }
-        catch {
-            Write-Console "  Failed to query SMART: $_" -Type "Error"
-        }
-    }
+    $card2 = New-ToolCard -Title "SMART Check" -Desc "FailurePredictStatus - early warning of drive failure" -BtnText "Check SMART" -X 320 -Y $y -OnClick { Get-SmartStatus }
     $null = $page.Controls.Add($card2)
     
     $card3 = New-ToolCard -Title "Event Log Analysis" -Desc "Critical events: 55, 50, 98, 129, 153, 157 (7 days)" -BtnText "Analyze Logs" -X 610 -Y $y -OnClick { Get-FilesystemEvents }
@@ -3636,26 +3161,7 @@ function Build-DiagnosticsPage {
     $card5 = New-ToolCard -Title "Dirty Bit Status" -Desc "Check volumes that will run CHKDSK on boot" -BtnText "Check Status" -X 320 -Y $y -OnClick { Get-DirtyBitStatus }
     $null = $page.Controls.Add($card5)
     
-    $card6 = New-ToolCard -Title "Reliability Counters" -Desc "Read/Write errors, temperature, wear level" -BtnText "View Counters" -X 610 -Y $y -OnClick {
-        Write-Console "=== Storage Reliability Counters ===" -Type "Info"
-        Write-Console "" -Type "Normal"
-        try {
-            Get-PhysicalDisk | Get-StorageReliabilityCounter -ErrorAction Stop | ForEach-Object {
-                Write-Console "  Device ID: $($_.DeviceId)" -Type "Info"
-                Write-Console "    Read Errors (Total): $($_.ReadErrorsTotal)" -Type $(if ($_.ReadErrorsTotal -gt 0) { "Warning" } else { "Normal" })
-                Write-Console "    Read Errors (Corrected): $($_.ReadErrorsCorrected)" -Type "Normal"
-                Write-Console "    Read Errors (Uncorrected): $($_.ReadErrorsUncorrected)" -Type $(if ($_.ReadErrorsUncorrected -gt 0) { "Error" } else { "Normal" })
-                Write-Console "    Write Errors (Total): $($_.WriteErrorsTotal)" -Type $(if ($_.WriteErrorsTotal -gt 0) { "Warning" } else { "Normal" })
-                Write-Console "    Temperature: $($_.Temperature)°C" -Type $(if ($_.Temperature -gt 50) { "Warning" } else { "Normal" })
-                Write-Console "    Wear: $($_.Wear)" -Type $(if ($_.Wear -gt 80) { "Warning" } else { "Normal" })
-                Write-Console "    Power On Hours: $($_.PowerOnHours)" -Type "Normal"
-                Write-Console "" -Type "Normal"
-            }
-        }
-        catch {
-            Write-Console "  Reliability counters not available: $_" -Type "Warning"
-        }
-    }
+    $card6 = New-ToolCard -Title "Reliability Counters" -Desc "Read/Write errors, temperature, wear level" -BtnText "View Counters" -X 610 -Y $y -OnClick { Get-ReliabilityCounter }
     $null = $page.Controls.Add($card6)
     $y += 130
     

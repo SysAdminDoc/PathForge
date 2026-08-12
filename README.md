@@ -65,12 +65,16 @@ Every major feature includes an expandable info panel explaining:
 ### Option 1: Direct Download
 ```powershell
 # Download and run
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SysAdminDoc/PathForge/main/PathForge.ps1" -OutFile "$env:TEMP\PathForge.ps1"
-& "$env:TEMP\PathForge.ps1"
+$pathForgeDir = Join-Path $env:TEMP "PathForge"
+New-Item -Path $pathForgeDir -ItemType Directory -Force | Out-Null
+$baseUrl = "https://raw.githubusercontent.com/SysAdminDoc/PathForge/main"
+Invoke-WebRequest -Uri "$baseUrl/PathForge.ps1" -OutFile "$pathForgeDir\PathForge.ps1"
+Invoke-WebRequest -Uri "$baseUrl/PathForge.Core.psm1" -OutFile "$pathForgeDir\PathForge.Core.psm1"
+& "$pathForgeDir\PathForge.ps1"
 ```
 
 ### Option 2: Manual
-1. Download `PathForge.ps1` from [Releases](https://github.com/SysAdminDoc/PathForge/releases)
+1. Download `PathForge.ps1` and `PathForge.Core.psm1` from [Releases](https://github.com/SysAdminDoc/PathForge/releases), keeping them in the same folder
 2. Right-click -> **Run with PowerShell**
 3. Accept the UAC prompt
 
@@ -114,6 +118,13 @@ For corrupted systems, run repairs in this order:
 ```
 
 The **Full Repair Sequence** button automates this process.
+
+Reusable deletion, repair, and diagnostic commands are also available for automation:
+
+```powershell
+Import-Module .\PathForge.Core.psm1
+Get-Command -Module PathForge.Core
+```
 
 ---
 

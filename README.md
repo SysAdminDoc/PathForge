@@ -40,6 +40,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 ### 📊 Diagnostics
 - **Drive Health Report** — Physical disk info, volumes, and partition layout
 - **MFT Layout Report** — Read native NTFS size, record, extent, and fragmentation data with a physical-placement graph and CSV export
+- **USN Journal Browser** — Browse recent NTFS changes by reason flags, close summaries, and optional process evidence without changing the journal
 - **SMART Monitoring** — Failure prediction with critical attribute warnings
 - **Reliability Counters** — Read/write errors, temperature, wear leveling
 - **Event Log Analysis** — Surface disk-related warnings (Event IDs 55, 50, 98, 129, 153, 157)
@@ -148,6 +149,12 @@ Open **MFT Layout** from Diagnostics to inspect the selected NTFS volume without
 
 The report is NTFS-only and uses the application's required administrator access. If Windows provides volume metadata but refuses the extent query, PathForge keeps the size report visible and explains why the placement map is unavailable.
 
+### USN Journal Browser
+
+Open **USN Journal** from Diagnostics to read a bounded recent window of an NTFS change journal. Filter by native reason flags (create, delete, rename, data, security, reparse, stream, or basic-information changes), request final close summaries, cap retained records, and export the normalized results to CSV. PathForge only calls query/read controls; it never creates, resizes, or deletes a journal.
+
+USN records do not contain a process ID or executable name. When **Correlate process evidence** is enabled—or a process-name filter is entered—PathForge makes a best-effort name/time correlation against existing Security event 4663 records. This is labeled as correlated evidence, not direct USN attribution, and is available only when Audit File System and a matching object SACL already produced those events. PathForge does not change audit policy or SACLs.
+
 ### Repair Sequence
 For corrupted systems, run repairs in this order:
 
@@ -221,6 +228,7 @@ PathForge includes detailed explanations accessible via **ℹ️ Show Details** 
 - **MoveFileEx** — Boot-time deletion scheduling (MOVEFILE_DELAY_UNTIL_REBOOT)
 - **FSCTL_GET_NTFS_VOLUME_DATA** — Read NTFS volume geometry, MFT size, record size, and reserved zone
 - **FSCTL_GET_RETRIEVAL_POINTERS** — Enumerate the physical extents backing the MFT without changing the volume
+- **FSCTL_QUERY_USN_JOURNAL / FSCTL_READ_USN_JOURNAL** — Query journal metadata and selectively read change records by reason flags
 - **FSCTL_GET_REPARSE_POINT** — Native reparse tag and target inspection without following the link
 - **FindFirstFileNameW / FindNextFileNameW** — Enumerate every hard-link name
 - **DeleteFileW / RemoveDirectoryW** — Remove only a recognized link or hard-link name without recursive traversal
@@ -231,6 +239,7 @@ PathForge includes detailed explanations accessible via **ℹ️ Show Details** 
 - 8.3 short names accessed via `fsutil file setshortname` enumeration
 - Robocopy `/MIR` with empty source efficiently removes nested structures
 - NTFS ADS enumeration via `Get-Item -Stream *`
+- Optional process evidence comes from existing Security event 4663 file-audit records and is explicitly reported as a correlation
 
 ### Error Handling
 - All operations wrapped in try/catch with user-friendly messages

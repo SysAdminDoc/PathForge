@@ -37,7 +37,8 @@ Describe "PathForge.Core module boundary" {
                 'Get-PathForgeLinkInfo', 'Find-PathForgeReparsePoint', 'Remove-PathForgeLinkSafe',
                 'Get-PathForgeQuarantineItem', 'Move-PathForgeToQuarantine',
                 'Restore-PathForgeQuarantineItem', 'Remove-PathForgeQuarantineItem',
-                'Invoke-PathForgeQuarantineMaintenance', 'Get-PathForgeMftReport')) {
+                'Invoke-PathForgeQuarantineMaintenance', 'Get-PathForgeUsnReasonCatalog',
+                'Get-PathForgeUsnJournal', 'Get-PathForgeMftReport')) {
             (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
         }
     }
@@ -151,6 +152,112 @@ Describe "PathForge.Core module boundary" {
         $report.SmartStatuses.Count | Should -Be 1
         $report.ReliabilityCounters.Count | Should -Be 1
         $report.Errors.Count | Should -Be 0
+    }
+
+    It "decodes USN version 2 records from a native journal buffer" {
+        $fileNameBytes = [System.Text.Encoding]::Unicode.GetBytes('test.txt')
+        $recordLength = 80
+        $buffer = New-Object byte[] (8 + $recordLength)
+        $copyValue = {
+            param([byte[]]$Bytes, [int]$Offset)
+            [System.Buffer]::BlockCopy($Bytes, 0, $buffer, $Offset, $Bytes.Length)
+        }
+        & $copyValue ([BitConverter]::GetBytes([int64]9000)) 0
+        & $copyValue ([BitConverter]::GetBytes([uint32]$recordLength)) 8
+        & $copyValue ([BitConverter]::GetBytes([uint16]2)) 12
+        & $copyValue ([BitConverter]::GetBytes([uint16]0)) 14
+        & $copyValue ([BitConverter]::GetBytes([uint64]0x1234)) 16
+        & $copyValue ([BitConverter]::GetBytes([uint64]0x5678)) 24
+        & $copyValue ([BitConverter]::GetBytes([int64]8765)) 32
+        & $copyValue ([BitConverter]::GetBytes([datetime]::UtcNow.ToFileTimeUtc())) 40
+        & $copyValue ([BitConverter]::GetBytes([uint32]0x00002100)) 48
+        & $copyValue ([BitConverter]::GetBytes([uint32]0x00000002)) 52
+        & $copyValue ([BitConverter]::GetBytes([uint32]17)) 56
+        & $copyValue ([BitConverter]::GetBytes([uint32]0x00000020)) 60
+        & $copyValue ([BitConverter]::GetBytes([uint16]$fileNameBytes.Length)) 64
+        & $copyValue ([BitConverter]::GetBytes([uint16]60)) 66
+        [System.Buffer]::BlockCopy($fileNameBytes, 0, $buffer, 68, $fileNameBytes.Length)
+
+        $records = @([PathForgeUsnNative]::ParseRecordBuffer($buffer, $buffer.Length))
+
+        $records.Count | Should -Be 1
+        $records[0].FileName | Should -Be 'test.txt'
+        $records[0].FileReferenceNumber | Should -Be '0000000000001234'
+        $records[0].ParentFileReferenceNumber | Should -Be '0000000000005678'
+        $records[0].Usn | Should -Be 8765
+        $records[0].Reason | Should -Be 0x00002100
+        $records[0].SourceInfo | Should -Be 2
+    }
+
+    It "exposes canonical USN reason flags including the unsigned close bit" {
+        $catalog = @(Get-PathForgeUsnReasonCatalog)
+        $close = $catalog | Where-Object Name -eq 'Close'
+
+        $catalog.Count | Should -BeGreaterThan 20
+        $close.Mask.GetType().FullName | Should -Be 'System.UInt32'
+        ('{0:X8}' -f $close.Mask) | Should -Be '80000000'
+    }
+
+    It "filters USN records and correlates optional process evidence from Security auditing" {
+        $eventTime = [datetime]::UtcNow.AddSeconds(-2)
+        Mock Get-VolumeFileSystem -ModuleName PathForge.Core { 'NTFS' }
+        Mock Get-PathForgeUsnJournalNative -ModuleName PathForge.Core {
+            [PSCustomObject]@{
+                Journal = [PSCustomObject]@{
+                    JournalId = [uint64]123
+                    FirstUsn = [int64]100
+                    NextUsn = [int64]9000
+                    LowestValidUsn = [int64]100
+                    MaxUsn = [int64]999999
+                    MaximumSize = [uint64](32MB)
+                    AllocationDelta = [uint64](8MB)
+                    MinSupportedMajorVersion = [uint16]2
+                    MaxSupportedMajorVersion = [uint16]3
+                }
+                RequestedStartUsn = [int64]1000
+                ResumeUsn = [int64]9000
+                TotalRecordsRead = 2
+                WasLimited = $false
+                Records = @(
+                    [PSCustomObject]@{MajorVersion=2;MinorVersion=0;FileReferenceNumber='1';ParentFileReferenceNumber='2';Usn=8000;TimestampUtc=$eventTime;Reason=[uint32]0x00000100;SourceInfo=[uint32]0;SecurityId=[uint32]1;FileAttributes=[uint32]0x20;FileName='report.txt'},
+                    [PSCustomObject]@{MajorVersion=2;MinorVersion=0;FileReferenceNumber='3';ParentFileReferenceNumber='2';Usn=8100;TimestampUtc=$eventTime;Reason=[uint32]0x00000200;SourceInfo=[uint32]2;SecurityId=[uint32]1;FileAttributes=[uint32]0x20;FileName='old.log'}
+                )
+            }
+        }
+        Mock Get-PathForgeUsnAuditEvent -ModuleName PathForge.Core {
+            [PSCustomObject]@{
+                TimeCreatedUtc = $eventTime.AddMilliseconds(250)
+                ObjectName = 'C:\Work\report.txt'
+                ProcessId = 4242
+                ProcessPath = 'C:\Windows\System32\notepad.exe'
+                ProcessName = 'notepad.exe'
+                EventRecordId = 77
+                AccessMask = '0x2'
+            }
+        }
+
+        $report = Get-PathForgeUsnJournal -Drive 'c:' -ReasonMask ([uint32]0x00000100) -IncludeProcessAudit -ProcessName 'notepad'
+
+        $report.Success | Should -BeTrue
+        $report.RecordCount | Should -Be 1
+        $report.Records[0].FileName | Should -Be 'report.txt'
+        $report.Records[0].ReasonText | Should -Match 'File create'
+        $report.Records[0].ProcessName | Should -Be 'notepad.exe'
+        $report.Records[0].ProcessId | Should -Be 4242
+        $report.Records[0].ProcessEvidence | Should -Match 'Security 4663'
+        $report.AuditStatus | Should -Match 'Correlated process evidence for 1 of 1'
+    }
+
+    It "rejects USN journal reads on non-NTFS volumes before native access" {
+        Mock Get-VolumeFileSystem -ModuleName PathForge.Core { 'ReFS' }
+        Mock Get-PathForgeUsnJournalNative -ModuleName PathForge.Core { throw 'must not query the journal' }
+
+        $report = Get-PathForgeUsnJournal -Drive 'D:'
+
+        $report.Success | Should -BeFalse
+        $report.Supported | Should -BeFalse
+        $report.Error | Should -Match 'only to NTFS'
+        Should -Invoke Get-PathForgeUsnJournalNative -ModuleName PathForge.Core -Times 0
     }
 
     It "builds an MFT size and fragmentation report from native volume extents" {
@@ -1084,6 +1191,38 @@ Describe "MFT size and fragmentation report GUI" {
         $coreSource | Should -Match 'FSCTL_GET_RETRIEVAL_POINTERS'
         $coreSource | Should -Match 'NativeNtfsVolumeData'
         $coreSource | Should -Match 'PathForgeFileExtent'
+    }
+}
+
+Describe "USN Journal browser GUI" {
+    It "exposes read-only reason and process-evidence filters from Drive Diagnostics" {
+        $diagnosticsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-DiagnosticsPage'
+        }, $true) | Select-Object -First 1
+        $browserAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-UsnJournalBrowser'
+        }, $true) | Select-Object -First 1
+
+        $diagnosticsAst.Extent.Text | Should -Match 'Title "USN Journal"'
+        $diagnosticsAst.Extent.Text | Should -Match 'Show-UsnJournalBrowser'
+        $browserAst.Extent.Text | Should -Match 'UsnReasonCombo'
+        $browserAst.Extent.Text | Should -Match 'UsnProcessFilter'
+        $browserAst.Extent.Text | Should -Match 'UsnJournalGrid'
+        $browserAst.Extent.Text | Should -Match 'Get-PathForgeUsnJournal'
+        $browserAst.Extent.Text | Should -Match 'Process is not stored in USN records'
+        $browserAst.Extent.Text | Should -Match 'Export CSV'
+    }
+
+    It "uses native query and selective journal-read controls without create or delete controls" {
+        $coreSource = Get-Content -Raw -LiteralPath $coreModulePath
+
+        $coreSource | Should -Match 'FSCTL_QUERY_USN_JOURNAL'
+        $coreSource | Should -Match 'FSCTL_READ_USN_JOURNAL'
+        $coreSource | Should -Match 'READ_USN_JOURNAL'
+        $coreSource | Should -Not -Match 'FSCTL_CREATE_USN_JOURNAL'
+        $coreSource | Should -Not -Match 'FSCTL_DELETE_USN_JOURNAL'
     }
 }
 

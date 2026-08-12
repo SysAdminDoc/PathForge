@@ -3887,6 +3887,411 @@ function Show-MftReport {
     $dialog.Dispose()
 }
 
+function Show-UsnJournalBrowser {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "NTFS USN Journal Browser"
+    $dialog.Size = New-Object System.Drawing.Size(1260, 800)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(1120, 700)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.Add_HandleCreated({ try { [DarkMode]::EnableDarkTitleBar($this.Handle) } catch { Write-Verbose "USN browser title-bar theming failed: $_" } })
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "NTFS USN Change Journal"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $Script:Theme.TextPrimary
+    $title.Location = New-Object System.Drawing.Point(20, 14)
+    $title.AutoSize = $true
+    $null = $dialog.Controls.Add($title)
+
+    $description = New-Object System.Windows.Forms.Label
+    $description.Text = "Read-only recent-change browser with native reason filtering and optional process evidence correlation."
+    $description.ForeColor = $Script:Theme.TextMuted
+    $description.Location = New-Object System.Drawing.Point(22, 46)
+    $description.Size = New-Object System.Drawing.Size(900, 22)
+    $null = $dialog.Controls.Add($description)
+
+    $filterPanel = New-Object System.Windows.Forms.Panel
+    $filterPanel.Name = "UsnFilterPanel"
+    $filterPanel.Location = New-Object System.Drawing.Point(20, 76)
+    $filterPanel.Size = New-Object System.Drawing.Size(1200, 108)
+    $filterPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $filterPanel.BackColor = $Script:Theme.BgCard
+    $null = $dialog.Controls.Add($filterPanel)
+
+    $addFilterLabel = {
+        param([string]$Text, [int]$X, [int]$Width)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 7.5)
+        $label.ForeColor = $Script:Theme.TextMuted
+        $label.Location = New-Object System.Drawing.Point($X, 9)
+        $label.Size = New-Object System.Drawing.Size($Width, 18)
+        $null = $filterPanel.Controls.Add($label)
+    }
+
+    & $addFilterLabel 'NTFS DRIVE' 16 120
+    & $addFilterLabel 'REASON FLAGS' 146 230
+    & $addFilterLabel 'PROCESS CONTAINS' 386 180
+    & $addFilterLabel 'MAX RECORDS' 576 100
+    & $addFilterLabel 'SCAN WINDOW (MB)' 686 120
+
+    $driveCombo = New-Object System.Windows.Forms.ComboBox
+    $driveCombo.Name = "UsnDriveCombo"
+    $driveCombo.AccessibleName = "Select NTFS drive for USN journal browser"
+    $driveCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $driveCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $driveCombo.BackColor = $Script:Theme.BgInput
+    $driveCombo.ForeColor = $Script:Theme.TextPrimary
+    $driveCombo.Location = New-Object System.Drawing.Point(16, 29)
+    $driveCombo.Size = New-Object System.Drawing.Size(120, 25)
+    try {
+        foreach ($volume in @(Get-Volume -ErrorAction Stop | Where-Object { $_.DriveLetter -and $_.FileSystem -eq 'NTFS' })) {
+            $null = $driveCombo.Items.Add("$($volume.DriveLetter):")
+        }
+    }
+    catch {
+        Write-Verbose "Could not enumerate NTFS volumes for the USN browser: $_"
+    }
+    if ($driveCombo.Items.Count -eq 0 -and $env:SystemDrive -match '^[A-Za-z]:$') {
+        $null = $driveCombo.Items.Add($env:SystemDrive)
+    }
+    if ($driveCombo.Items.Count -gt 0) { $driveCombo.SelectedIndex = 0 }
+    $null = $filterPanel.Controls.Add($driveCombo)
+
+    $reasonCombo = New-Object System.Windows.Forms.ComboBox
+    $reasonCombo.Name = "UsnReasonCombo"
+    $reasonCombo.AccessibleName = "Filter USN records by reason flags"
+    $reasonCombo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $reasonCombo.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $reasonCombo.BackColor = $Script:Theme.BgInput
+    $reasonCombo.ForeColor = $Script:Theme.TextPrimary
+    $reasonCombo.Location = New-Object System.Drawing.Point(146, 29)
+    $reasonCombo.Size = New-Object System.Drawing.Size(230, 25)
+    $reasonCombo.DisplayMember = 'Label'
+    $reasonChoices = @(
+        [PSCustomObject]@{Label = 'All changes'; Mask = [uint32]::MaxValue },
+        [PSCustomObject]@{Label = 'File created'; Mask = [uint32]0x00000100 },
+        [PSCustomObject]@{Label = 'File deleted'; Mask = [uint32]0x00000200 },
+        [PSCustomObject]@{Label = 'Renamed (old or new name)'; Mask = [uint32]0x00003000 },
+        [PSCustomObject]@{Label = 'Data changed'; Mask = [uint32]0x00000077 },
+        [PSCustomObject]@{Label = 'Security changed'; Mask = [uint32]0x00000800 },
+        [PSCustomObject]@{Label = 'Reparse point changed'; Mask = [uint32]0x00100000 },
+        [PSCustomObject]@{Label = 'Stream changed'; Mask = [uint32]0x00200000 },
+        [PSCustomObject]@{Label = 'Basic info changed'; Mask = [uint32]0x00008000 }
+    )
+    foreach ($choice in $reasonChoices) { $null = $reasonCombo.Items.Add($choice) }
+    $reasonCombo.SelectedIndex = 0
+    $null = $filterPanel.Controls.Add($reasonCombo)
+
+    $processText = New-Object System.Windows.Forms.TextBox
+    $processText.Name = "UsnProcessFilter"
+    $processText.AccessibleName = "Filter correlated process name"
+    $processText.BackColor = $Script:Theme.BgInput
+    $processText.ForeColor = $Script:Theme.TextPrimary
+    $processText.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $processText.Location = New-Object System.Drawing.Point(386, 30)
+    $processText.Size = New-Object System.Drawing.Size(180, 24)
+    $null = $filterPanel.Controls.Add($processText)
+
+    $maxRecordsInput = New-Object System.Windows.Forms.NumericUpDown
+    $maxRecordsInput.Name = "UsnMaxRecords"
+    $maxRecordsInput.AccessibleName = "Maximum USN records"
+    $maxRecordsInput.Minimum = 25
+    $maxRecordsInput.Maximum = 50000
+    $maxRecordsInput.Increment = 25
+    $maxRecordsInput.Value = 500
+    $maxRecordsInput.BackColor = $Script:Theme.BgInput
+    $maxRecordsInput.ForeColor = $Script:Theme.TextPrimary
+    $maxRecordsInput.Location = New-Object System.Drawing.Point(576, 30)
+    $maxRecordsInput.Size = New-Object System.Drawing.Size(100, 24)
+    $maxRecordsInput.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Right
+    $null = $filterPanel.Controls.Add($maxRecordsInput)
+
+    $scanWindowInput = New-Object System.Windows.Forms.NumericUpDown
+    $scanWindowInput.Name = "UsnScanMegabytes"
+    $scanWindowInput.AccessibleName = "USN journal scan window in megabytes"
+    $scanWindowInput.Minimum = 1
+    $scanWindowInput.Maximum = 1024
+    $scanWindowInput.Increment = 16
+    $scanWindowInput.Value = 64
+    $scanWindowInput.BackColor = $Script:Theme.BgInput
+    $scanWindowInput.ForeColor = $Script:Theme.TextPrimary
+    $scanWindowInput.Location = New-Object System.Drawing.Point(686, 30)
+    $scanWindowInput.Size = New-Object System.Drawing.Size(120, 24)
+    $scanWindowInput.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Right
+    $null = $filterPanel.Controls.Add($scanWindowInput)
+
+    $auditCheck = New-Object System.Windows.Forms.CheckBox
+    $auditCheck.Name = "UsnProcessCorrelation"
+    $auditCheck.AccessibleName = "Correlate existing Security audit process evidence"
+    $auditCheck.Text = "Correlate process evidence"
+    $auditCheck.ForeColor = $Script:Theme.TextSecondary
+    $auditCheck.Location = New-Object System.Drawing.Point(822, 17)
+    $auditCheck.Size = New-Object System.Drawing.Size(190, 24)
+    $null = $filterPanel.Controls.Add($auditCheck)
+
+    $closeOnlyCheck = New-Object System.Windows.Forms.CheckBox
+    $closeOnlyCheck.Name = "UsnCloseOnly"
+    $closeOnlyCheck.AccessibleName = "Return only final close summary records"
+    $closeOnlyCheck.Text = "Close summaries only"
+    $closeOnlyCheck.ForeColor = $Script:Theme.TextSecondary
+    $closeOnlyCheck.Location = New-Object System.Drawing.Point(822, 43)
+    $closeOnlyCheck.Size = New-Object System.Drawing.Size(175, 24)
+    $null = $filterPanel.Controls.Add($closeOnlyCheck)
+
+    $queryButton = New-Object System.Windows.Forms.Button
+    $queryButton.Text = "Query Journal"
+    $queryButton.AccessibleName = "Query the selected NTFS change journal"
+    $queryButton.Location = New-Object System.Drawing.Point(1040, 25)
+    $queryButton.Size = New-Object System.Drawing.Size(140, 36)
+    $queryButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $queryButton.BackColor = $Script:Theme.Accent
+    $queryButton.ForeColor = [System.Drawing.Color]::White
+    $queryButton.FlatAppearance.BorderSize = 0
+    $queryButton.Enabled = $driveCombo.Items.Count -gt 0
+    $null = $filterPanel.Controls.Add($queryButton)
+
+    $processNote = New-Object System.Windows.Forms.Label
+    $processNote.Text = "Process is not stored in USN records. Optional filtering correlates existing Security event 4663 evidence; audit policy and SACLs are never changed."
+    $processNote.ForeColor = $Script:Theme.TextMuted
+    $processNote.Location = New-Object System.Drawing.Point(16, 75)
+    $processNote.Size = New-Object System.Drawing.Size(1165, 22)
+    $null = $filterPanel.Controls.Add($processNote)
+
+    $summaryPanel = New-Object System.Windows.Forms.Panel
+    $summaryPanel.Name = "UsnSummaryPanel"
+    $summaryPanel.Location = New-Object System.Drawing.Point(20, 194)
+    $summaryPanel.Size = New-Object System.Drawing.Size(1200, 62)
+    $summaryPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $summaryPanel.BackColor = $Script:Theme.BgCard
+    $null = $dialog.Controls.Add($summaryPanel)
+
+    $summaryValues = @{}
+    foreach ($definition in @(
+            @{Key = 'Size'; Title = 'JOURNAL TARGET SIZE'; X = 18; Width = 250 },
+            @{Key = 'Range'; Title = 'USN RANGE'; X = 300; Width = 340 },
+            @{Key = 'Records'; Title = 'RECORDS RETURNED'; X = 670; Width = 230 },
+            @{Key = 'Process'; Title = 'PROCESS EVIDENCE'; X = 930; Width = 245 })) {
+        $heading = New-Object System.Windows.Forms.Label
+        $heading.Text = $definition.Title
+        $heading.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 7.5)
+        $heading.ForeColor = $Script:Theme.TextMuted
+        $heading.Location = New-Object System.Drawing.Point($definition.X, 7)
+        $heading.Size = New-Object System.Drawing.Size($definition.Width, 17)
+        $null = $summaryPanel.Controls.Add($heading)
+
+        $value = New-Object System.Windows.Forms.Label
+        $value.Name = "UsnSummary$($definition.Key)"
+        $value.Text = '-'
+        $value.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10.5)
+        $value.ForeColor = $Script:Theme.Info
+        $value.Location = New-Object System.Drawing.Point($definition.X, 27)
+        $value.Size = New-Object System.Drawing.Size($definition.Width, 27)
+        $value.AutoEllipsis = $true
+        $null = $summaryPanel.Controls.Add($value)
+        $summaryValues[$definition.Key] = $value
+    }
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "UsnJournalGrid"
+    $grid.AccessibleName = "USN change journal records"
+    $grid.Location = New-Object System.Drawing.Point(20, 266)
+    $grid.Size = New-Object System.Drawing.Size(1200, 390)
+    $grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $grid.BackgroundColor = $Script:Theme.BgInput
+    $grid.ForeColor = $Script:Theme.TextPrimary
+    $grid.GridColor = $Script:Theme.Border
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $grid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $grid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $grid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $grid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.RowHeadersVisible = $false
+    foreach ($columnDefinition in @(
+            @{Name = 'Time'; Header = 'Local time'; Width = 165 },
+            @{Name = 'Name'; Header = 'File name'; Width = 210 },
+            @{Name = 'Reason'; Header = 'Reason flags'; Width = 270 },
+            @{Name = 'Process'; Header = 'Correlated process'; Width = 150 },
+            @{Name = 'Pid'; Header = 'PID'; Width = 65 },
+            @{Name = 'Usn'; Header = 'USN'; Width = 130 },
+            @{Name = 'Source'; Header = 'Source'; Width = 130 },
+            @{Name = 'Attributes'; Header = 'Attributes'; Width = 145 })) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.Name = $columnDefinition.Name
+        $column.HeaderText = $columnDefinition.Header
+        $column.Width = $columnDefinition.Width
+        $column.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+        if ($columnDefinition.Name -eq 'Name') { $column.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill }
+        $null = $grid.Columns.Add($column)
+    }
+    $null = $dialog.Controls.Add($grid)
+
+    $evidenceLabel = New-Object System.Windows.Forms.Label
+    $evidenceLabel.Name = "UsnAuditStatus"
+    $evidenceLabel.ForeColor = $Script:Theme.TextMuted
+    $evidenceLabel.Location = New-Object System.Drawing.Point(22, 665)
+    $evidenceLabel.Size = New-Object System.Drawing.Size(1195, 34)
+    $evidenceLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $evidenceLabel.Text = 'Process evidence has not been requested.'
+    $null = $dialog.Controls.Add($evidenceLabel)
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Name = "UsnBrowserStatus"
+    $statusLabel.ForeColor = $Script:Theme.TextMuted
+    $statusLabel.Location = New-Object System.Drawing.Point(22, 714)
+    $statusLabel.Size = New-Object System.Drawing.Size(880, 28)
+    $statusLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $statusLabel.Text = if ($driveCombo.Items.Count -gt 0) { 'Ready to read the selected journal.' } else { 'No local NTFS volumes were found.' }
+    $null = $dialog.Controls.Add($statusLabel)
+
+    $exportButton = New-Object System.Windows.Forms.Button
+    $exportButton.Text = "Export CSV"
+    $exportButton.AccessibleName = "Export USN journal records to CSV"
+    $exportButton.Location = New-Object System.Drawing.Point(1018, 708)
+    $exportButton.Size = New-Object System.Drawing.Size(95, 32)
+    $exportButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $exportButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $exportButton.BackColor = $Script:Theme.BgTertiary
+    $exportButton.ForeColor = $Script:Theme.TextSecondary
+    $exportButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $exportButton.Enabled = $false
+    $null = $dialog.Controls.Add($exportButton)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $closeButton.Location = New-Object System.Drawing.Point(1122, 708)
+    $closeButton.Size = New-Object System.Drawing.Size(98, 32)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.BackColor = $Script:Theme.BgTertiary
+    $closeButton.ForeColor = $Script:Theme.TextSecondary
+    $closeButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $null = $dialog.Controls.Add($closeButton)
+    $dialog.CancelButton = $closeButton
+
+    $formatBytes = {
+        param([uint64]$Value)
+        if ($Value -ge 1GB) { return ('{0:N2} GB' -f ($Value / 1GB)) }
+        if ($Value -ge 1MB) { return ('{0:N2} MB' -f ($Value / 1MB)) }
+        if ($Value -ge 1KB) { return ('{0:N2} KB' -f ($Value / 1KB)) }
+        return "$Value bytes"
+    }
+
+    $loadState = [PSCustomObject]@{Running = $false}
+    $loadJournal = {
+        if ($loadState.Running -or $driveCombo.SelectedIndex -lt 0) { return }
+        $loadState.Running = $true
+        $queryButton.Enabled = $false
+        $statusLabel.Text = "Reading recent USN records from $($driveCombo.Text)..."
+        $statusLabel.ForeColor = $Script:Theme.Info
+        try {
+            if ($grid.Rows.Count -gt 0) { $grid.Rows.Clear() }
+            $reasonMask = [uint32]$reasonCombo.SelectedItem.Mask
+            $processFilter = $processText.Text.Trim()
+            $report = Get-PathForgeUsnJournal `
+                -Drive $driveCombo.Text `
+                -MaxRecords ([int]$maxRecordsInput.Value) `
+                -ScanMegabytes ([int]$scanWindowInput.Value) `
+                -ReasonMask $reasonMask `
+                -ReturnOnlyOnClose:$closeOnlyCheck.Checked `
+                -IncludeProcessAudit:$auditCheck.Checked `
+                -ProcessName $processFilter
+            $dialog.Tag = $report
+            if (-not $report.Success) {
+                foreach ($valueLabel in $summaryValues.Values) { $valueLabel.Text = '-' }
+                $evidenceLabel.Text = $report.AuditStatus
+                $statusLabel.Text = $report.Error
+                $statusLabel.ForeColor = $Script:Theme.Error
+                $exportButton.Enabled = $false
+                Write-Console "USN journal query failed for $($driveCombo.Text): $($report.Error)" -Type "Error"
+                return
+            }
+
+            $summaryValues.Size.Text = & $formatBytes $report.MaximumSize
+            $summaryValues.Range.Text = ('{0:N0} -> {1:N0}' -f $report.FirstUsn, $report.NextUsn)
+            $summaryValues.Records.Text = ('{0:N0} shown / {1:N0} read' -f $report.RecordCount, $report.TotalRecordsRead)
+            $summaryValues.Process.Text = if ($report.ProcessAuditUsed) { "$($report.ProcessCoverage) correlated" } else { 'Not requested' }
+            foreach ($record in $report.Records) {
+                $timeText = if ($record.TimeCreated) { $record.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss.fff') } else { '-' }
+                $processTextValue = if ([string]::IsNullOrWhiteSpace($record.ProcessName)) { '-' } else { $record.ProcessName }
+                $processIdValue = if ($null -eq $record.ProcessId) { '-' } else { $record.ProcessId }
+                $rowIndex = $grid.Rows.Add(
+                    $timeText,
+                    $record.FileName,
+                    $record.ReasonText,
+                    $processTextValue,
+                    $processIdValue,
+                    ('{0:N0}' -f $record.Usn),
+                    $record.SourceText,
+                    $record.FileAttributesText)
+                $grid.Rows[$rowIndex].Tag = $record
+                $grid.Rows[$rowIndex].Cells['Name'].ToolTipText = "File ID: $($record.FileReferenceNumber); parent: $($record.ParentFileReferenceNumber)"
+                if ($record.ProcessEvidence) {
+                    $grid.Rows[$rowIndex].Cells['Process'].ToolTipText = "$($record.ProcessPath) - $($record.ProcessEvidence), delta $($record.CorrelationDeltaMilliseconds) ms"
+                }
+            }
+            $evidenceLabel.Text = $report.AuditStatus
+            $evidenceLabel.ForeColor = if ($report.AuditError) { $Script:Theme.Warning } else { $Script:Theme.TextMuted }
+            $limitText = if ($report.WasLimited) { ' The record cap retained the newest matches.' } else { '' }
+            $statusLabel.Text = "Read-only query complete: $($report.RecordCount) matching record(s) in a $($report.ScanMegabytes) MB recent window.$limitText"
+            $statusLabel.ForeColor = $Script:Theme.Success
+            $exportButton.Enabled = $report.RecordCount -gt 0
+            Write-Console "USN $($report.Drive): $($report.RecordCount) record(s), reason mask $('0x{0:X8}' -f $report.ReasonMask)" -Type "Info"
+            Write-Log "USN journal queried: drive=$($report.Drive) records=$($report.RecordCount) processCoverage=$($report.ProcessCoverage)" -Level "INFO"
+        }
+        catch {
+            $statusLabel.Text = $_.Exception.Message
+            $statusLabel.ForeColor = $Script:Theme.Error
+            $exportButton.Enabled = $false
+            Write-Console "USN journal query failed: $($_.Exception.Message)" -Type "Error"
+        }
+        finally {
+            $queryButton.Enabled = $driveCombo.Items.Count -gt 0
+            $loadState.Running = $false
+        }
+    }.GetNewClosure()
+
+    $processText.Add_TextChanged({ if (-not [string]::IsNullOrWhiteSpace($processText.Text)) { $auditCheck.Checked = $true } }.GetNewClosure())
+    $queryButton.Add_Click({ & $loadJournal }.GetNewClosure())
+    $exportButton.Add_Click({
+        $report = $dialog.Tag
+        if (-not $report -or -not $report.Success -or $report.RecordCount -eq 0) { return }
+        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Title = "Export USN journal records"
+        $saveDialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+        $saveDialog.FileName = "USN_$($report.Drive.TrimEnd(':'))_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        $saveDialog.InitialDirectory = $Script:Config.LogPath
+        if ($saveDialog.ShowDialog($dialog) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        try {
+            $report.Records | Select-Object TimeCreated, FileName, ReasonHex, ReasonText, SourceText, FileAttributesText, Usn, FileReferenceNumber, ParentFileReferenceNumber, ProcessName, ProcessId, ProcessPath, ProcessEvidence, AuditEventRecordId, CorrelationDeltaMilliseconds |
+                Export-Csv -LiteralPath $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            Write-Console "USN journal report exported: $($saveDialog.FileName)" -Type "Success"
+            Write-Log "USN journal report exported: $($saveDialog.FileName)" -Level "SUCCESS"
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, "Export Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $dialog.Add_Shown({ & $loadJournal }.GetNewClosure())
+
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) { [void]$dialog.ShowDialog($owner) } else { [void]$dialog.ShowDialog() }
+    $dialog.Dispose()
+}
+
 # ============================================================================
 # UI COMPONENTS
 # ============================================================================
@@ -4848,6 +5253,9 @@ function Build-DiagnosticsPage {
 
     $mftCard = New-ToolCard -Title "MFT Layout" -Desc "Report Master File Table size, records, extents, and physical fragmentation graph" -BtnText "Open MFT Report" -X 30 -Y $y -OnClick { Show-MftReport }
     $null = $page.Controls.Add($mftCard)
+
+    $usnCard = New-ToolCard -Title "USN Journal" -Desc "Browse recent NTFS changes by reason flags and optional process evidence" -BtnText "Open Journal" -X 320 -Y $y -OnClick { Show-UsnJournalBrowser }
+    $null = $page.Controls.Add($usnCard)
     $y += 130
     
     # SMART Info Panel

@@ -365,6 +365,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 public sealed class PathForgeNtfsVolumeData {
@@ -382,6 +383,332 @@ public sealed class PathForgeNtfsVolumeData {
     public long Mft2StartLcn { get; set; }
     public long MftZoneStart { get; set; }
     public long MftZoneEnd { get; set; }
+}
+
+public sealed class PathForgeUsnJournalData {
+    public ulong JournalId { get; set; }
+    public long FirstUsn { get; set; }
+    public long NextUsn { get; set; }
+    public long LowestValidUsn { get; set; }
+    public long MaxUsn { get; set; }
+    public ulong MaximumSize { get; set; }
+    public ulong AllocationDelta { get; set; }
+    public ushort MinSupportedMajorVersion { get; set; }
+    public ushort MaxSupportedMajorVersion { get; set; }
+}
+
+public sealed class PathForgeUsnRecordData {
+    public ushort MajorVersion { get; set; }
+    public ushort MinorVersion { get; set; }
+    public string FileReferenceNumber { get; set; }
+    public string ParentFileReferenceNumber { get; set; }
+    public long Usn { get; set; }
+    public DateTime? TimestampUtc { get; set; }
+    public uint Reason { get; set; }
+    public uint SourceInfo { get; set; }
+    public uint SecurityId { get; set; }
+    public uint FileAttributes { get; set; }
+    public string FileName { get; set; }
+}
+
+public sealed class PathForgeUsnReadResult {
+    public string Drive { get; set; }
+    public PathForgeUsnJournalData Journal { get; set; }
+    public long RequestedStartUsn { get; set; }
+    public long ResumeUsn { get; set; }
+    public int TotalRecordsRead { get; set; }
+    public bool WasLimited { get; set; }
+    public PathForgeUsnRecordData[] Records { get; set; }
+}
+
+public static class PathForgeUsnNative {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint GENERIC_WRITE = 0x40000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint FILE_SHARE_WRITE = 0x00000002;
+    private const uint FILE_SHARE_DELETE = 0x00000004;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FSCTL_READ_USN_JOURNAL = 0x000900BB;
+    private const uint FSCTL_QUERY_USN_JOURNAL = 0x000900F4;
+    private const int ERROR_HANDLE_EOF = 38;
+    private const int ERROR_JOURNAL_DELETE_IN_PROGRESS = 1178;
+    private const int ERROR_JOURNAL_NOT_ACTIVE = 1179;
+    private const int ERROR_JOURNAL_ENTRY_DELETED = 1181;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)]
+    private static extern bool DeviceIoControlBuffer(
+        SafeFileHandle device,
+        uint controlCode,
+        byte[] inputBuffer,
+        int inputBufferSize,
+        byte[] outputBuffer,
+        int outputBufferSize,
+        out int bytesReturned,
+        IntPtr overlapped);
+
+    private static string NormalizeDrive(string drive) {
+        if (String.IsNullOrWhiteSpace(drive)) {
+            throw new ArgumentException("A drive in X: format is required.", "drive");
+        }
+        string normalized = drive.Trim().TrimEnd('\\');
+        if (normalized.Length != 2 || normalized[1] != ':' || !Char.IsLetter(normalized[0])) {
+            throw new ArgumentException("A drive in X: format is required.", "drive");
+        }
+        return Char.ToUpperInvariant(normalized[0]) + ":";
+    }
+
+    private static SafeFileHandle OpenVolume(string drive) {
+        string path = @"\\.\" + NormalizeDrive(drive);
+        uint shareMode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        SafeFileHandle handle = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, shareMode, IntPtr.Zero, OPEN_EXISTING, 0, IntPtr.Zero);
+        if (handle.IsInvalid) {
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            string detail = new Win32Exception(error).Message;
+            throw new Win32Exception(error, "Cannot open " + path + " for USN journal access: " + detail);
+        }
+        return handle;
+    }
+
+    private static Exception JournalException(int error, string operation) {
+        if (error == ERROR_JOURNAL_NOT_ACTIVE) {
+            return new InvalidOperationException("The NTFS change journal is not active on this volume.");
+        }
+        if (error == ERROR_JOURNAL_DELETE_IN_PROGRESS) {
+            return new InvalidOperationException("The NTFS change journal is currently being deleted.");
+        }
+        return new Win32Exception(error, operation + " failed: " + new Win32Exception(error).Message);
+    }
+
+    private static PathForgeUsnJournalData QueryJournal(SafeFileHandle handle) {
+        byte[] output = new byte[96];
+        int bytesReturned;
+        if (!DeviceIoControlBuffer(handle, FSCTL_QUERY_USN_JOURNAL, null, 0, output, output.Length, out bytesReturned, IntPtr.Zero)) {
+            throw JournalException(Marshal.GetLastWin32Error(), "FSCTL_QUERY_USN_JOURNAL");
+        }
+        if (bytesReturned < 56) {
+            throw new InvalidDataException("Windows returned an incomplete USN journal data buffer.");
+        }
+
+        PathForgeUsnJournalData data = new PathForgeUsnJournalData {
+            JournalId = BitConverter.ToUInt64(output, 0),
+            FirstUsn = BitConverter.ToInt64(output, 8),
+            NextUsn = BitConverter.ToInt64(output, 16),
+            LowestValidUsn = BitConverter.ToInt64(output, 24),
+            MaxUsn = BitConverter.ToInt64(output, 32),
+            MaximumSize = BitConverter.ToUInt64(output, 40),
+            AllocationDelta = BitConverter.ToUInt64(output, 48),
+            MinSupportedMajorVersion = bytesReturned >= 60 ? BitConverter.ToUInt16(output, 56) : (ushort)2,
+            MaxSupportedMajorVersion = bytesReturned >= 60 ? BitConverter.ToUInt16(output, 58) : (ushort)2
+        };
+        return data;
+    }
+
+    private static string ReadFileId(byte[] buffer, int offset, int byteCount) {
+        if (byteCount == 8) {
+            return BitConverter.ToUInt64(buffer, offset).ToString("X16");
+        }
+        byte[] raw = new byte[byteCount];
+        Buffer.BlockCopy(buffer, offset, raw, 0, byteCount);
+        Array.Reverse(raw);
+        StringBuilder builder = new StringBuilder(byteCount * 2);
+        foreach (byte value in raw) {
+            builder.Append(value.ToString("X2"));
+        }
+        return builder.ToString();
+    }
+
+    public static PathForgeUsnRecordData[] ParseRecordBuffer(byte[] buffer, int bytesReturned) {
+        if (buffer == null) {
+            throw new ArgumentNullException("buffer");
+        }
+        if (bytesReturned < 8 || bytesReturned > buffer.Length) {
+            throw new InvalidDataException("The USN record buffer length is invalid.");
+        }
+
+        List<PathForgeUsnRecordData> records = new List<PathForgeUsnRecordData>();
+        int offset = 8;
+        while (offset < bytesReturned) {
+            if (bytesReturned - offset < 8) {
+                throw new InvalidDataException("Windows returned a truncated USN record header.");
+            }
+            uint recordLength = BitConverter.ToUInt32(buffer, offset);
+            if (recordLength == 0) {
+                break;
+            }
+            if (recordLength > Int32.MaxValue || offset + (long)recordLength > bytesReturned) {
+                throw new InvalidDataException("A USN record extends beyond the returned buffer.");
+            }
+
+            ushort majorVersion = BitConverter.ToUInt16(buffer, offset + 4);
+            ushort minorVersion = BitConverter.ToUInt16(buffer, offset + 6);
+            int minimumLength;
+            int fileIdOffset;
+            int parentIdOffset;
+            int fileIdLength;
+            int usnOffset;
+            int timestampOffset;
+            int reasonOffset;
+            int sourceOffset;
+            int securityOffset;
+            int attributesOffset;
+            int fileNameLengthOffset;
+            int fileNameOffsetOffset;
+
+            if (majorVersion == 2) {
+                minimumLength = 60;
+                fileIdOffset = 8;
+                parentIdOffset = 16;
+                fileIdLength = 8;
+                usnOffset = 24;
+                timestampOffset = 32;
+                reasonOffset = 40;
+                sourceOffset = 44;
+                securityOffset = 48;
+                attributesOffset = 52;
+                fileNameLengthOffset = 56;
+                fileNameOffsetOffset = 58;
+            }
+            else if (majorVersion == 3) {
+                minimumLength = 76;
+                fileIdOffset = 8;
+                parentIdOffset = 24;
+                fileIdLength = 16;
+                usnOffset = 40;
+                timestampOffset = 48;
+                reasonOffset = 56;
+                sourceOffset = 60;
+                securityOffset = 64;
+                attributesOffset = 68;
+                fileNameLengthOffset = 72;
+                fileNameOffsetOffset = 74;
+            }
+            else {
+                offset += (int)recordLength;
+                continue;
+            }
+
+            if (recordLength < minimumLength) {
+                throw new InvalidDataException("Windows returned an undersized USN version " + majorVersion + " record.");
+            }
+            ushort fileNameLength = BitConverter.ToUInt16(buffer, offset + fileNameLengthOffset);
+            ushort fileNameOffset = BitConverter.ToUInt16(buffer, offset + fileNameOffsetOffset);
+            if ((fileNameLength & 1) != 0 || fileNameOffset < minimumLength || fileNameOffset + (long)fileNameLength > recordLength) {
+                throw new InvalidDataException("A USN record contains an invalid file-name range.");
+            }
+
+            long fileTime = BitConverter.ToInt64(buffer, offset + timestampOffset);
+            DateTime? timestamp = null;
+            if (fileTime > 0) {
+                try { timestamp = DateTime.FromFileTimeUtc(fileTime); }
+                catch (ArgumentOutOfRangeException) { timestamp = null; }
+            }
+
+            records.Add(new PathForgeUsnRecordData {
+                MajorVersion = majorVersion,
+                MinorVersion = minorVersion,
+                FileReferenceNumber = ReadFileId(buffer, offset + fileIdOffset, fileIdLength),
+                ParentFileReferenceNumber = ReadFileId(buffer, offset + parentIdOffset, fileIdLength),
+                Usn = BitConverter.ToInt64(buffer, offset + usnOffset),
+                TimestampUtc = timestamp,
+                Reason = BitConverter.ToUInt32(buffer, offset + reasonOffset),
+                SourceInfo = BitConverter.ToUInt32(buffer, offset + sourceOffset),
+                SecurityId = BitConverter.ToUInt32(buffer, offset + securityOffset),
+                FileAttributes = BitConverter.ToUInt32(buffer, offset + attributesOffset),
+                FileName = Encoding.Unicode.GetString(buffer, offset + fileNameOffset, fileNameLength)
+            });
+            offset += (int)recordLength;
+        }
+        return records.ToArray();
+    }
+
+    public static PathForgeUsnReadResult ReadJournal(string drive, long scanBytes, int maxRecords, uint reasonMask, bool returnOnlyOnClose) {
+        string normalized = NormalizeDrive(drive);
+        if (scanBytes < 1024 * 1024) {
+            throw new ArgumentOutOfRangeException("scanBytes", "The journal scan window must be at least 1 MB.");
+        }
+        if (maxRecords < 1 || maxRecords > 50000) {
+            throw new ArgumentOutOfRangeException("maxRecords", "The record limit must be between 1 and 50,000.");
+        }
+
+        using (SafeFileHandle handle = OpenVolume(normalized)) {
+            PathForgeUsnJournalData journal = QueryJournal(handle);
+            long requestedStart = Math.Max(journal.FirstUsn, journal.NextUsn - scanBytes);
+            long cursor = requestedStart;
+            int totalRecordsRead = 0;
+            Queue<PathForgeUsnRecordData> retained = new Queue<PathForgeUsnRecordData>(maxRecords);
+            byte[] output = new byte[1024 * 1024];
+
+            for (int requestIndex = 0; requestIndex < 1024 && cursor < journal.NextUsn; requestIndex++) {
+                byte[] input = new byte[48];
+                Buffer.BlockCopy(BitConverter.GetBytes(cursor), 0, input, 0, 8);
+                Buffer.BlockCopy(BitConverter.GetBytes(reasonMask), 0, input, 8, 4);
+                Buffer.BlockCopy(BitConverter.GetBytes(returnOnlyOnClose ? 1u : 0u), 0, input, 12, 4);
+                Buffer.BlockCopy(BitConverter.GetBytes(journal.JournalId), 0, input, 32, 8);
+                Buffer.BlockCopy(BitConverter.GetBytes((ushort)2), 0, input, 40, 2);
+                Buffer.BlockCopy(BitConverter.GetBytes((ushort)3), 0, input, 42, 2);
+
+                int bytesReturned;
+                bool success = DeviceIoControlBuffer(
+                    handle,
+                    FSCTL_READ_USN_JOURNAL,
+                    input,
+                    input.Length,
+                    output,
+                    output.Length,
+                    out bytesReturned,
+                    IntPtr.Zero);
+                int error = success ? 0 : Marshal.GetLastWin32Error();
+                if (!success && error == ERROR_HANDLE_EOF) {
+                    break;
+                }
+                if (!success && error == ERROR_JOURNAL_ENTRY_DELETED && cursor != journal.FirstUsn) {
+                    cursor = journal.FirstUsn;
+                    requestedStart = cursor;
+                    continue;
+                }
+                if (!success) {
+                    throw JournalException(error, "FSCTL_READ_USN_JOURNAL");
+                }
+                if (bytesReturned < 8) {
+                    throw new InvalidDataException("Windows returned an incomplete USN journal read buffer.");
+                }
+
+                long nextCursor = BitConverter.ToInt64(output, 0);
+                foreach (PathForgeUsnRecordData record in ParseRecordBuffer(output, bytesReturned)) {
+                    totalRecordsRead++;
+                    if (retained.Count == maxRecords) {
+                        retained.Dequeue();
+                    }
+                    retained.Enqueue(record);
+                }
+                if (nextCursor <= cursor) {
+                    break;
+                }
+                cursor = nextCursor;
+            }
+
+            return new PathForgeUsnReadResult {
+                Drive = normalized,
+                Journal = journal,
+                RequestedStartUsn = requestedStart,
+                ResumeUsn = cursor,
+                TotalRecordsRead = totalRecordsRead,
+                WasLimited = totalRecordsRead > retained.Count,
+                Records = retained.ToArray()
+            };
+        }
+    }
 }
 
 public sealed class PathForgeFileExtent {
@@ -2463,6 +2790,349 @@ function Get-PathForgeNtfsVolumeDataNative {
     return [PathForgeNtfsNative]::GetVolumeData($Drive)
 }
 
+function Get-PathForgeUsnReasonCatalog {
+    [CmdletBinding()]
+    param()
+
+    $closeMask = [uint32]::Parse('80000000', [System.Globalization.NumberStyles]::HexNumber, [System.Globalization.CultureInfo]::InvariantCulture)
+    return @(
+        [PSCustomObject]@{Name = 'Data overwrite'; Mask = [uint32]0x00000001; Group = 'Data' },
+        [PSCustomObject]@{Name = 'Data extend'; Mask = [uint32]0x00000002; Group = 'Data' },
+        [PSCustomObject]@{Name = 'Data truncate'; Mask = [uint32]0x00000004; Group = 'Data' },
+        [PSCustomObject]@{Name = 'Named data overwrite'; Mask = [uint32]0x00000010; Group = 'Data' },
+        [PSCustomObject]@{Name = 'Named data extend'; Mask = [uint32]0x00000020; Group = 'Data' },
+        [PSCustomObject]@{Name = 'Named data truncate'; Mask = [uint32]0x00000040; Group = 'Data' },
+        [PSCustomObject]@{Name = 'File create'; Mask = [uint32]0x00000100; Group = 'Lifecycle' },
+        [PSCustomObject]@{Name = 'File delete'; Mask = [uint32]0x00000200; Group = 'Lifecycle' },
+        [PSCustomObject]@{Name = 'Extended attributes'; Mask = [uint32]0x00000400; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Security change'; Mask = [uint32]0x00000800; Group = 'Security' },
+        [PSCustomObject]@{Name = 'Rename old name'; Mask = [uint32]0x00001000; Group = 'Rename' },
+        [PSCustomObject]@{Name = 'Rename new name'; Mask = [uint32]0x00002000; Group = 'Rename' },
+        [PSCustomObject]@{Name = 'Indexable change'; Mask = [uint32]0x00004000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Basic info change'; Mask = [uint32]0x00008000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Hard link change'; Mask = [uint32]0x00010000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Compression change'; Mask = [uint32]0x00020000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Encryption change'; Mask = [uint32]0x00040000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Object ID change'; Mask = [uint32]0x00080000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Reparse point change'; Mask = [uint32]0x00100000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Stream change'; Mask = [uint32]0x00200000; Group = 'Data' },
+        [PSCustomObject]@{Name = 'Transacted change'; Mask = [uint32]0x00400000; Group = 'Metadata' },
+        [PSCustomObject]@{Name = 'Integrity change'; Mask = [uint32]0x00800000; Group = 'Security' },
+        [PSCustomObject]@{Name = 'Close'; Mask = $closeMask; Group = 'Lifecycle' }
+    )
+}
+
+function ConvertTo-PathForgeUsnReasonText {
+    param([Parameter(Mandatory)][uint32]$Reason)
+
+    $names = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($definition in Get-PathForgeUsnReasonCatalog) {
+        if (($Reason -band [uint32]$definition.Mask) -ne 0) {
+            $names.Add([string]$definition.Name)
+        }
+    }
+    if ($names.Count -eq 0) { return ('Unknown (0x{0:X8})' -f $Reason) }
+    return $names -join ', '
+}
+
+function ConvertTo-PathForgeUsnSourceText {
+    param([Parameter(Mandatory)][uint32]$SourceInfo)
+
+    if ($SourceInfo -eq 0) { return 'Application data' }
+    $sources = New-Object 'System.Collections.Generic.List[string]'
+    if (($SourceInfo -band [uint32]0x00000001) -ne 0) { $sources.Add('Data management') }
+    if (($SourceInfo -band [uint32]0x00000002) -ne 0) { $sources.Add('Auxiliary data') }
+    if (($SourceInfo -band [uint32]0x00000004) -ne 0) { $sources.Add('Replication management') }
+    if (($SourceInfo -band [uint32]0x00000008) -ne 0) { $sources.Add('Client replication') }
+    if ($sources.Count -eq 0) { return ('Unknown (0x{0:X8})' -f $SourceInfo) }
+    return $sources -join ', '
+}
+
+function Get-PathForgeUsnJournalNative {
+    param(
+        [Parameter(Mandatory)][string]$Drive,
+        [Parameter(Mandatory)][int64]$ScanBytes,
+        [Parameter(Mandatory)][int]$MaxRecords,
+        [Parameter(Mandatory)][uint32]$ReasonMask,
+        [Parameter(Mandatory)][bool]$ReturnOnlyOnClose
+    )
+    return [PathForgeUsnNative]::ReadJournal($Drive, $ScanBytes, $MaxRecords, $ReasonMask, $ReturnOnlyOnClose)
+}
+
+function Get-PathForgeUsnAuditEvent {
+    param(
+        [Parameter(Mandatory)][datetime]$StartTimeUtc,
+        [Parameter(Mandatory)][datetime]$EndTimeUtc,
+        [Parameter(Mandatory)][string]$Drive,
+        [ValidateRange(1, 50000)][int]$MaxEvents = 10000
+    )
+
+    $filter = @{
+        LogName   = 'Security'
+        Id        = 4663
+        StartTime = $StartTimeUtc.ToLocalTime()
+        EndTime   = $EndTimeUtc.ToLocalTime()
+    }
+    try {
+        $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents $MaxEvents -ErrorAction Stop)
+    }
+    catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*' -or $_.Exception.Message -match 'No events were found') {
+            return @()
+        }
+        throw
+    }
+
+    $normalizedPrefix = $Drive.TrimEnd(':') + ':\'
+    foreach ($eventRecord in $events) {
+        try {
+            [xml]$eventXml = $eventRecord.ToXml()
+            $eventData = @{}
+            foreach ($dataNode in @($eventXml.Event.EventData.Data)) {
+                $eventData[[string]$dataNode.Name] = [string]$dataNode.'#text'
+            }
+            if ($eventData.ObjectType -ne 'File' -or
+                [string]::IsNullOrWhiteSpace($eventData.ObjectName) -or
+                -not $eventData.ObjectName.StartsWith($normalizedPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+
+            [int64]$processId = 0
+            $processIdText = [string]$eventData.ProcessId
+            if ($processIdText.StartsWith('0x', [System.StringComparison]::OrdinalIgnoreCase)) {
+                [void][int64]::TryParse(
+                    $processIdText.Substring(2),
+                    [System.Globalization.NumberStyles]::HexNumber,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$processId)
+            }
+            else {
+                [void][int64]::TryParse($processIdText, [ref]$processId)
+            }
+
+            [PSCustomObject]@{
+                TimeCreatedUtc = $eventRecord.TimeCreated.ToUniversalTime()
+                ObjectName     = [string]$eventData.ObjectName
+                ProcessId      = $processId
+                ProcessPath    = [string]$eventData.ProcessName
+                ProcessName    = if ([string]::IsNullOrWhiteSpace($eventData.ProcessName)) { '' } else { [System.IO.Path]::GetFileName($eventData.ProcessName) }
+                EventRecordId  = $eventRecord.RecordId
+                AccessMask     = [string]$eventData.AccessMask
+            }
+        }
+        catch {
+            continue
+        }
+    }
+}
+
+function Get-PathForgeUsnJournal {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z]:$')]
+        [string]$Drive,
+
+        [ValidateRange(1, 50000)]
+        [int]$MaxRecords = 500,
+
+        [ValidateRange(1, 1024)]
+        [int]$ScanMegabytes = 64,
+
+        [uint32]$ReasonMask = [uint32]::MaxValue,
+
+        [switch]$ReturnOnlyOnClose,
+
+        [switch]$IncludeProcessAudit,
+
+        [string]$ProcessName,
+
+        [ValidateRange(1, 30)]
+        [int]$CorrelationSeconds = 3
+    )
+
+    $normalizedDrive = $Drive.Substring(0, 1).ToUpperInvariant() + ':'
+    $fileSystem = Get-VolumeFileSystem -Path "$normalizedDrive\"
+    if ($fileSystem -notin @('NTFS', 'Unknown')) {
+        return [PSCustomObject]@{
+            Success       = $false
+            Supported     = $false
+            Drive         = $normalizedDrive
+            FileSystem    = $fileSystem
+            Records       = @()
+            AuditStatus   = 'Not requested.'
+            Error         = "The USN Journal browser applies only to NTFS volumes; $normalizedDrive uses $fileSystem."
+        }
+    }
+
+    try {
+        $nativeResult = Get-PathForgeUsnJournalNative `
+            -Drive $normalizedDrive `
+            -ScanBytes ([int64]$ScanMegabytes * 1MB) `
+            -MaxRecords $MaxRecords `
+            -ReasonMask $ReasonMask `
+            -ReturnOnlyOnClose ([bool]$ReturnOnlyOnClose)
+        $fileSystem = 'NTFS'
+    }
+    catch {
+        $rootException = $_.Exception
+        while ($rootException.InnerException) { $rootException = $rootException.InnerException }
+        $message = $rootException.Message
+        if (($rootException -is [System.ComponentModel.Win32Exception] -and $rootException.NativeErrorCode -eq 5) -or
+            $message -match 'Access is denied|denied access') {
+            $message = "Administrator access is required to read the NTFS change journal. $message"
+        }
+        return [PSCustomObject]@{
+            Success       = $false
+            Supported     = $fileSystem -eq 'NTFS'
+            Drive         = $normalizedDrive
+            FileSystem    = $fileSystem
+            Records       = @()
+            AuditStatus   = 'Not requested.'
+            Error         = $message
+        }
+    }
+
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($rawRecord in @($nativeResult.Records)) {
+        $rawReason = [uint32]$rawRecord.Reason
+        if ($ReasonMask -ne [uint32]::MaxValue -and ($rawReason -band $ReasonMask) -eq 0) { continue }
+        $timestampUtc = if ($null -eq $rawRecord.TimestampUtc) { $null } else { ([datetime]$rawRecord.TimestampUtc).ToUniversalTime() }
+        $records.Add([PSCustomObject]@{
+                TimeCreatedUtc           = $timestampUtc
+                TimeCreated              = if ($timestampUtc) { $timestampUtc.ToLocalTime() } else { $null }
+                FileName                 = [string]$rawRecord.FileName
+                FileReferenceNumber      = [string]$rawRecord.FileReferenceNumber
+                ParentFileReferenceNumber = [string]$rawRecord.ParentFileReferenceNumber
+                Usn                       = [int64]$rawRecord.Usn
+                Reason                    = $rawReason
+                ReasonHex                 = ('0x{0:X8}' -f $rawReason)
+                ReasonText                = ConvertTo-PathForgeUsnReasonText -Reason $rawReason
+                SourceInfo                = [uint32]$rawRecord.SourceInfo
+                SourceText                = ConvertTo-PathForgeUsnSourceText -SourceInfo ([uint32]$rawRecord.SourceInfo)
+                SecurityId                = [uint32]$rawRecord.SecurityId
+                FileAttributes            = [uint32]$rawRecord.FileAttributes
+                FileAttributesText        = ([System.IO.FileAttributes][uint32]$rawRecord.FileAttributes).ToString()
+                IsDirectory               = ([uint32]$rawRecord.FileAttributes -band [uint32]0x00000010) -ne 0
+                RecordVersion             = "$($rawRecord.MajorVersion).$($rawRecord.MinorVersion)"
+                ProcessName               = $null
+                ProcessPath               = $null
+                ProcessId                 = $null
+                ProcessEvidence           = $null
+                AuditEventRecordId        = $null
+                CorrelationDeltaMilliseconds = $null
+            })
+    }
+
+    $auditRequested = $IncludeProcessAudit -or -not [string]::IsNullOrWhiteSpace($ProcessName)
+    $auditStatus = 'Process correlation was not requested.'
+    $auditError = $null
+    if ($auditRequested -and $records.Count -gt 0) {
+        $timestampedRecords = @($records | Where-Object { $null -ne $_.TimeCreatedUtc })
+        if ($timestampedRecords.Count -eq 0) {
+            $auditStatus = 'Process correlation is unavailable because these records have no timestamp.'
+        }
+        else {
+            $startTimeUtc = ($timestampedRecords | Measure-Object TimeCreatedUtc -Minimum).Minimum.AddSeconds(-$CorrelationSeconds)
+            $endTimeUtc = ($timestampedRecords | Measure-Object TimeCreatedUtc -Maximum).Maximum.AddSeconds($CorrelationSeconds)
+            try {
+                $maxAuditEvents = [Math]::Min(50000, [Math]::Max(1000, $MaxRecords * 10))
+                $auditEvents = @(Get-PathForgeUsnAuditEvent -StartTimeUtc $startTimeUtc -EndTimeUtc $endTimeUtc -Drive $normalizedDrive -MaxEvents $maxAuditEvents)
+                $eventsByFileName = @{}
+                foreach ($auditEvent in $auditEvents) {
+                    $leafName = [System.IO.Path]::GetFileName([string]$auditEvent.ObjectName)
+                    if ([string]::IsNullOrWhiteSpace($leafName)) { continue }
+                    $key = $leafName.ToUpperInvariant()
+                    if (-not $eventsByFileName.ContainsKey($key)) {
+                        $eventsByFileName[$key] = New-Object 'System.Collections.Generic.List[object]'
+                    }
+                    $eventsByFileName[$key].Add($auditEvent)
+                }
+
+                foreach ($record in $records) {
+                    if ($null -eq $record.TimeCreatedUtc -or [string]::IsNullOrWhiteSpace($record.FileName)) { continue }
+                    $key = $record.FileName.ToUpperInvariant()
+                    if (-not $eventsByFileName.ContainsKey($key)) { continue }
+                    $bestEvent = $null
+                    [double]$bestDelta = [double]::MaxValue
+                    foreach ($candidate in $eventsByFileName[$key]) {
+                        $delta = [Math]::Abs(($candidate.TimeCreatedUtc - $record.TimeCreatedUtc).TotalMilliseconds)
+                        if ($delta -le ($CorrelationSeconds * 1000) -and $delta -lt $bestDelta) {
+                            $bestDelta = $delta
+                            $bestEvent = $candidate
+                        }
+                    }
+                    if ($bestEvent) {
+                        $record.ProcessName = $bestEvent.ProcessName
+                        $record.ProcessPath = $bestEvent.ProcessPath
+                        $record.ProcessId = $bestEvent.ProcessId
+                        $record.ProcessEvidence = 'Security 4663 name/time correlation'
+                        $record.AuditEventRecordId = $bestEvent.EventRecordId
+                        $record.CorrelationDeltaMilliseconds = [Math]::Round($bestDelta)
+                    }
+                }
+                $coverage = @($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ProcessName) }).Count
+                if ($auditEvents.Count -eq 0) {
+                    $auditStatus = 'No matching Security 4663 events were available. Process attribution requires Audit File System and a matching SACL.'
+                }
+                else {
+                    $auditStatus = "Correlated process evidence for $coverage of $($records.Count) record(s) from Security event 4663."
+                }
+            }
+            catch {
+                $auditError = $_.Exception.Message
+                $auditStatus = "Process correlation unavailable: $auditError"
+            }
+        }
+    }
+
+    $processCoverage = @($records | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ProcessName) }).Count
+    $filteredRecords = @(
+        if ([string]::IsNullOrWhiteSpace($ProcessName)) {
+            $records
+        }
+        else {
+            $records | Where-Object {
+                ([string]$_.ProcessName).IndexOf($ProcessName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                ([string]$_.ProcessPath).IndexOf($ProcessName, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            }
+        }
+    )
+
+    return [PSCustomObject]@{
+        Success            = $true
+        Supported          = $true
+        Drive              = $normalizedDrive
+        FileSystem         = $fileSystem
+        QueryTimeUtc       = [DateTimeOffset]::UtcNow
+        JournalId          = [uint64]$nativeResult.Journal.JournalId
+        FirstUsn           = [int64]$nativeResult.Journal.FirstUsn
+        NextUsn            = [int64]$nativeResult.Journal.NextUsn
+        LowestValidUsn     = [int64]$nativeResult.Journal.LowestValidUsn
+        MaxUsn             = [int64]$nativeResult.Journal.MaxUsn
+        MaximumSize        = [uint64]$nativeResult.Journal.MaximumSize
+        AllocationDelta    = [uint64]$nativeResult.Journal.AllocationDelta
+        MinRecordVersion   = [uint16]$nativeResult.Journal.MinSupportedMajorVersion
+        MaxRecordVersion   = [uint16]$nativeResult.Journal.MaxSupportedMajorVersion
+        RequestedStartUsn  = [int64]$nativeResult.RequestedStartUsn
+        ResumeUsn          = [int64]$nativeResult.ResumeUsn
+        ScanMegabytes      = $ScanMegabytes
+        ReasonMask         = $ReasonMask
+        ReturnOnlyOnClose  = [bool]$ReturnOnlyOnClose
+        TotalRecordsRead   = [int]$nativeResult.TotalRecordsRead
+        NativeRecordCount  = @($nativeResult.Records).Count
+        RecordCount        = $filteredRecords.Count
+        WasLimited         = [bool]$nativeResult.WasLimited
+        ProcessAuditUsed   = $auditRequested
+        ProcessCoverage    = $processCoverage
+        ProcessFilter      = $ProcessName
+        AuditStatus        = $auditStatus
+        AuditError         = $auditError
+        Records            = $filteredRecords
+        Error              = $null
+    }
+}
+
 function Get-PathForgeMftExtentNative {
     param([Parameter(Mandatory)][string]$Drive)
     $mftPath = [System.IO.Path]::Combine("$Drive\", '$MFT')
@@ -3073,6 +3743,8 @@ Export-ModuleMember -Function @(
     'Get-PathForgeDeletionPlan',
     'Import-PathForgeDeletionBatch',
     'Invoke-PathForgeDeletionMethod',
+    'Get-PathForgeUsnReasonCatalog',
+    'Get-PathForgeUsnJournal',
     'Get-PathForgeMftReport',
     'Get-DriveSmartHealth',
     'Get-VolumeCorruptionRecord',

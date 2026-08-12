@@ -25,6 +25,8 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 
 ### 🔧 Filesystem Repair
 - **CHKDSK Integration** — Online scan, offline repair, bad sector recovery, and spotfix modes
+- **SMART Repair Gate** — Warns and recommends a backup before CHKDSK /F or /R when the selected disk predicts failure
+- **Quick Corruption Count** — Reads the volume's recorded NTFS corruption count without starting a full scan
 - **DISM RestoreHealth** — Repair Windows component store corruption
 - **SFC Scannow** — System file integrity verification and repair
 - **Full Repair Sequence** — Automated DISM → SFC → CHKDSK in optimal order
@@ -132,6 +134,7 @@ The **Full Repair Sequence** button automates this process.
 - **Warning** — Yellow/orange text
 - **Progress** — Blue text with percentage updates
 - **Info** — Standard output
+- **Saveable Reports** — Export the formatted console to a timestamped text file
 
 All operations log to: `%USERPROFILE%\Documents\PathForge_Logs\Session_*.log`
 

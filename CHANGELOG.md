@@ -7,11 +7,15 @@ All notable changes to PathForge will be documented in this file.
 ### Added
 - Restart Manager lock-holder diagnostics report process names and PIDs before deletion attempts
 - Version badge in the README
+- Pre-repair SMART failure warning for CHKDSK /F and /R with an explicit override
+- Quick volume health card backed by the NTFS corruption-count provider
+- Save button for timestamped formatted console reports
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation
 - Bound the output console to 50,000 characters while preserving a visible trim marker
 - Apply safe-path validation consistently to ADS scanning/removal and file-unblock operations
+- Always remove the temporary empty directory after Robocopy failures
 
 ## [v3.1.0] - 2026-06-20
 

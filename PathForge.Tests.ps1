@@ -6,9 +6,10 @@ BeforeAll {
 
     $functionNames = @(
         'Test-SafePath', 'Get-ValidatedPath', 'Get-VolumeFileSystem',
-        'Get-FileLockProcess', 'Invoke-ConsoleOutputTrim',
+        'Get-FileLockProcess', 'Invoke-ConsoleOutputTrim', 'Export-ConsoleOutput',
+        'Get-DriveSmartHealth', 'Confirm-RepairDriveHealth', 'Get-VolumeCorruptionHealth',
         'Test-ReparsePoint', 'Remove-ReparsePointSafe',
-        'Remove-ItemStandard', 'Remove-ItemDotNet',
+        'Remove-ItemStandard', 'Remove-ItemDotNet', 'Remove-ItemRobocopy',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
         'Set-Status', 'Set-Progress',
         'Enter-Operation', 'Exit-Operation', 'Stop-ActiveOperation'
@@ -170,6 +171,114 @@ Describe "Active operation form-close safety" {
         $mainFormAst.Extent.Text | Should -Match 'An operation is running\. Cancel it and close\?'
         $mainFormAst.Extent.Text | Should -Match 'Stop-ActiveOperation'
         $mainFormAst.Extent.Text | Should -Match '\$closingEvent\.Cancel\s*=\s*\$true'
+    }
+}
+
+Describe "Output action layout" {
+    It "positions Save, Cancel, and Clear from the laid-out output panel width" {
+        $mainFormAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-MainForm'
+        }, $true) | Select-Object -First 1
+
+        $mainFormAst.Extent.Text | Should -Match '\$rightEdge\s*=\s*\$outputPanel\.ClientSize\.Width'
+        $mainFormAst.Extent.Text | Should -Match '\$saveBtn\.Left\s*=\s*\$cancelBtn\.Left'
+        $mainFormAst.Extent.Text | Should -Match 'Add_SizeChanged\(\$positionOutputActions\)'
+    }
+}
+
+Describe "Export-ConsoleOutput" {
+    It "writes the formatted console text to the log directory" {
+        $originalBox = $Script:OutputBox
+        $originalPath = $Script:Config.LogPath
+        try {
+            $Script:OutputBox = [PSCustomObject]@{ Text = "first line`r`nsecond line`r`n" }
+            $Script:Config.LogPath = Join-Path $TestDrive "console"
+
+            $outputPath = Export-ConsoleOutput
+
+            $outputPath | Should -Match 'Console_\d{8}_\d{6}\.txt$'
+            Test-Path -LiteralPath $outputPath | Should -BeTrue
+            [System.IO.File]::ReadAllText($outputPath) | Should -Be $Script:OutputBox.Text
+        }
+        finally {
+            $Script:OutputBox = $originalBox
+            $Script:Config.LogPath = $originalPath
+        }
+    }
+}
+
+Describe "Remove-ItemRobocopy cleanup" {
+    It "removes its empty temp directory when Robocopy throws" {
+        $originalTemp = $env:TEMP
+        $tempRoot = Join-Path $TestDrive "robocopy-temp"
+        $target = Join-Path $TestDrive "robocopy-target"
+        New-Item -Path $tempRoot -ItemType Directory -Force | Out-Null
+        New-Item -Path $target -ItemType Directory -Force | Out-Null
+        function robocopy { throw "simulated Robocopy failure" }
+
+        try {
+            $env:TEMP = $tempRoot
+            $result = Remove-ItemRobocopy -Path $target
+
+            $result.Success | Should -BeFalse
+            @(Get-ChildItem -LiteralPath $tempRoot -Filter 'PathForge_Empty_*').Count | Should -Be 0
+        }
+        finally {
+            $env:TEMP = $originalTemp
+            Remove-Item Function:\robocopy -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Describe "Get-DriveSmartHealth" {
+    It "maps the selected volume to its physical SMART record" {
+        Mock Get-Partition { [PSCustomObject]@{ DiskNumber = 4 } }
+        Mock Get-CimInstance {
+            if ($ClassName -eq 'Win32_DiskDrive') {
+                return [PSCustomObject]@{ PNPDeviceID = 'SCSI\DISK&VEN_TEST'; Model = 'Test Disk' }
+            }
+            return [PSCustomObject]@{
+                InstanceName  = 'SCSI\DISK&VEN_TEST_0'
+                PredictFailure = $true
+                Reason         = 9
+            }
+        }
+
+        $result = Get-DriveSmartHealth -Drive "D:"
+
+        $result.Available | Should -BeTrue
+        $result.PredictFailure | Should -BeTrue
+        $result.Reason | Should -Be 9
+        $result.DiskName | Should -Be 'Test Disk'
+    }
+}
+
+Describe "Confirm-RepairDriveHealth" {
+    BeforeEach {
+        Mock Get-DriveSmartHealth {
+            [PSCustomObject]@{ Available = $true; PredictFailure = $true; Reason = 1; DiskName = "Test Disk" }
+        }
+    }
+
+    It "cancels repair when the user declines the SMART warning" {
+        Confirm-RepairDriveHealth -Drive "D:" -Operation "CHKDSK /R" -PromptAction { 7 } | Should -BeFalse
+    }
+
+    It "allows an explicit override of the SMART warning" {
+        Confirm-RepairDriveHealth -Drive "D:" -Operation "CHKDSK /R" -PromptAction { 6 } | Should -BeTrue
+    }
+}
+
+Describe "Get-VolumeCorruptionHealth" {
+    It "returns and reports the volume corruption count" {
+        Mock Get-VolumeCorruptionCount { [uint32]3 }
+
+        $result = Get-VolumeCorruptionHealth -Drive "C:"
+
+        $result.Available | Should -BeTrue
+        $result.CorruptionCount | Should -Be 3
+        Should -Invoke Get-VolumeCorruptionCount -Times 1 -ParameterFilter { $DriveLetter -eq 'C' }
     }
 }
 

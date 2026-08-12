@@ -881,6 +881,35 @@ function Invoke-ConsoleOutputTrim {
     }
 }
 
+function Export-ConsoleOutput {
+    if (-not $Script:OutputBox -or [string]::IsNullOrWhiteSpace($Script:OutputBox.Text)) {
+        Set-Status "Console is empty"
+        return $null
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $Script:Config.LogPath)) {
+            New-Item -Path $Script:Config.LogPath -ItemType Directory -Force | Out-Null
+        }
+
+        $outputPath = Join-Path $Script:Config.LogPath "Console_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+        [System.IO.File]::WriteAllText(
+            $outputPath,
+            $Script:OutputBox.Text,
+            [System.Text.UTF8Encoding]::new($false))
+
+        Set-Status "Console saved: $outputPath"
+        Write-Log "Console output saved: $outputPath" -Level "SUCCESS"
+        return $outputPath
+    }
+    catch {
+        Set-Status "Console save failed"
+        Write-Console "Failed to save console output: $_" -Type "Error"
+        Write-Log "Console output save failed: $_" -Level "ERROR"
+        return $null
+    }
+}
+
 function Set-Status {
     param([string]$Message)
     if ($Script:StatusLabel) {
@@ -1109,6 +1138,7 @@ function Remove-ItemShortName {
 
 function Remove-ItemRobocopy {
     param([string]$Path)
+    $emptyDir = $null
     try {
         if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
             return @{Success = $false; Error = "Robocopy only works on directories" }
@@ -1118,7 +1148,6 @@ function Remove-ItemRobocopy {
         
         Write-Console "  Robocopy: Mirroring empty folder over target..." -Type "Progress"
         $null = robocopy $emptyDir $Path /MIR /R:0 /W:0 /NFL /NDL /NJH /NJS 2>&1
-        Remove-Item -Path $emptyDir -Force -ErrorAction SilentlyContinue
         
         $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rd /s /q `"$Path`"" -NoNewWindow -Wait -PassThru 2>$null
 
@@ -1128,6 +1157,11 @@ function Remove-ItemRobocopy {
         return @{Success = $false; Error = "Directory still exists" }
     }
     catch { return @{Success = $false; Error = $_.Exception.Message } }
+    finally {
+        if ($emptyDir -and (Test-Path -LiteralPath $emptyDir)) {
+            Remove-Item -LiteralPath $emptyDir -Force -Recurse -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Remove-ItemWMI {
@@ -1931,6 +1965,117 @@ function Invoke-UnblockRecursive {
 # ============================================================================
 # FILESYSTEM REPAIR
 # ============================================================================
+function Get-DriveSmartHealth {
+    param([string]$Drive)
+
+    try {
+        $driveLetter = $Drive.TrimEnd(':')
+        $partition = Get-Partition -DriveLetter $driveLetter -ErrorAction Stop | Select-Object -First 1
+        $disk = Get-CimInstance -ClassName Win32_DiskDrive -Filter "Index = $($partition.DiskNumber)" -ErrorAction Stop
+        if (-not $disk -or [string]::IsNullOrWhiteSpace($disk.PNPDeviceID)) {
+            throw "The physical disk could not be resolved"
+        }
+
+        $statuses = @(Get-CimInstance -Namespace root\wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)
+        $pnpDeviceId = [string]$disk.PNPDeviceID
+        $status = $statuses | Where-Object {
+            $_.InstanceName -and $_.InstanceName.StartsWith(
+                $pnpDeviceId,
+                [System.StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1
+
+        if (-not $status) {
+            return [PSCustomObject]@{
+                Available      = $false
+                PredictFailure = $false
+                Reason         = 0
+                DiskName       = $disk.Model
+            }
+        }
+
+        return [PSCustomObject]@{
+            Available      = $true
+            PredictFailure = [bool]$status.PredictFailure
+            Reason         = [uint32]$status.Reason
+            DiskName       = $disk.Model
+        }
+    }
+    catch {
+        Write-Log "SMART pre-repair query failed for $Drive : $_" -Level "WARN"
+        return [PSCustomObject]@{
+            Available      = $false
+            PredictFailure = $false
+            Reason         = 0
+            DiskName       = "Unknown"
+        }
+    }
+}
+
+function Confirm-RepairDriveHealth {
+    param(
+        [string]$Drive,
+        [string]$Operation,
+        [scriptblock]$PromptAction
+    )
+
+    $health = Get-DriveSmartHealth -Drive $Drive
+    if (-not $health.Available -or -not $health.PredictFailure) {
+        return $true
+    }
+
+    Write-Console "SMART predicts failure for $Drive ($($health.DiskName))" -Type "Error"
+    Write-Console "BACKUP FIRST before attempting $Operation" -Type "Error"
+
+    $message = "SMART reports that $Drive may be failing.`n`nBACKUP FIRST. Running $Operation on a failing drive can cause additional data loss.`n`nContinue anyway?"
+    $result = if ($PromptAction) {
+        & $PromptAction $message
+    }
+    else {
+        [System.Windows.Forms.MessageBox]::Show(
+            $message,
+            "Drive Failure Warning",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+    }
+
+    if ($result -eq 6) {
+        Write-Log "User overrode SMART failure warning for $Operation on $Drive" -Level "WARN"
+        return $true
+    }
+
+    Write-Console "$Operation cancelled - back up the drive before repair" -Type "Warning"
+    Write-Log "$Operation cancelled due to SMART failure warning on $Drive" -Level "WARN"
+    return $false
+}
+
+function Get-VolumeCorruptionHealth {
+    param([string]$Drive)
+
+    Write-Console "=== Quick Volume Health Check: $Drive ===" -Type "Info"
+    Set-Status "Checking volume corruption count..."
+
+    try {
+        $driveLetter = $Drive.TrimEnd(':')
+        $count = [uint32](Get-VolumeCorruptionCount -DriveLetter $driveLetter -ErrorAction Stop)
+        if ($count -gt 0) {
+            Write-Console "$Drive has $count recorded filesystem corruption(s)" -Type "Warning"
+            Write-Console "Run CHKDSK /scan to inspect the volume before repair" -Type "Info"
+        }
+        else {
+            Write-Console "$Drive has no recorded filesystem corruption" -Type "Success"
+        }
+
+        Set-Status "Quick health check complete"
+        return [PSCustomObject]@{ Drive = $Drive; CorruptionCount = $count; Available = $true }
+    }
+    catch {
+        Write-Console "Quick health check unavailable: $_" -Type "Warning"
+        Set-Status "Quick health check unavailable"
+        Write-Log "Volume corruption count failed for $Drive : $_" -Level "WARN"
+        return [PSCustomObject]@{ Drive = $Drive; CorruptionCount = 0; Available = $false }
+    }
+}
+
 function Invoke-ChkdskWithProgress {
     param([string]$Drive, [string]$Arguments)
 
@@ -1993,6 +2138,7 @@ function Invoke-ChkdskScan {
 
 function Invoke-ChkdskFix {
     param([string]$Drive)
+    if (-not (Confirm-RepairDriveHealth -Drive $Drive -Operation "CHKDSK /F")) { return }
     if (-not (Enter-Operation "CHKDSK /F $Drive")) { return }
 
     if ($Drive -eq "C:") {
@@ -2025,6 +2171,7 @@ function Invoke-ChkdskFix {
 
 function Invoke-ChkdskFull {
     param([string]$Drive)
+    if (-not (Confirm-RepairDriveHealth -Drive $Drive -Operation "CHKDSK /R")) { return }
     if (-not (Enter-Operation "CHKDSK /R $Drive")) { return }
 
     Write-Console "=== CHKDSK /R on $Drive ===" -Type "Warning"
@@ -3201,16 +3348,23 @@ function Build-RepairPage {
     }
     $null = $page.Controls.Add($card4)
     
-    $card5 = New-ToolCard -Title "Dirty Bit Status" -Desc "Check which volumes need CHKDSK on boot" -BtnText "Check Status" -X 320 -Y $y -OnClick { Get-DirtyBitStatus }
+    $card5 = New-ToolCard -Title "Quick Health Check" -Desc "Read the volume's recorded corruption count instantly" -BtnText "Check Volume" -X 320 -Y $y -OnClick {
+        $drive = $Script:DriveCombo.Text.Substring(0, 2)
+        Get-VolumeCorruptionHealth -Drive $drive | Out-Null
+    }
     $null = $page.Controls.Add($card5)
     
-    $card6 = New-ToolCard -Title "Force CHKDSK" -Desc "Set dirty bit to force CHKDSK on next reboot" -BtnText "Set Dirty Bit" -X 610 -Y $y -OnClick {
+    $card6 = New-ToolCard -Title "Dirty Bit Status" -Desc "Check which volumes need CHKDSK on boot" -BtnText "Check Status" -X 610 -Y $y -OnClick { Get-DirtyBitStatus }
+    $null = $page.Controls.Add($card6)
+    $y += 130
+
+    $card7 = New-ToolCard -Title "Force CHKDSK" -Desc "Set dirty bit to force CHKDSK on next reboot" -BtnText "Set Dirty Bit" -X 30 -Y $y -OnClick {
         $drive = $Script:DriveCombo.Text.Substring(0, 2)
         if ([System.Windows.Forms.MessageBox]::Show("Force CHKDSK on next boot for $drive`?`n`nThe system will run CHKDSK automatically when you restart.", "Confirm", 4, 48) -eq 6) {
             Set-DirtyBit -Drive $drive
         }
     }
-    $null = $page.Controls.Add($card6)
+    $null = $page.Controls.Add($card7)
     $y += 130
     
     # CHKDSK Info Panel
@@ -3705,9 +3859,23 @@ function Build-MainForm {
     $cancelBtn.FlatAppearance.BorderSize = 0
     $cancelBtn.Location = New-Object System.Drawing.Point(850, 5)
     $cancelBtn.Size = New-Object System.Drawing.Size(60, 22)
-    $cancelBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $cancelBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top
     $cancelBtn.Add_Click({ Stop-ActiveOperation })
     $null = $outputPanel.Controls.Add($cancelBtn)
+
+    $saveBtn = New-Object System.Windows.Forms.Button
+    $saveBtn.Text = "Save"
+    $saveBtn.Font = New-Object System.Drawing.Font("Segoe UI", 8)
+    $saveBtn.ForeColor = $Script:Theme.TextPrimary
+    $saveBtn.BackColor = $Script:Theme.BgTertiary
+    $saveBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $saveBtn.FlatAppearance.BorderColor = $Script:Theme.Border
+    $saveBtn.Location = New-Object System.Drawing.Point(785, 5)
+    $saveBtn.Size = New-Object System.Drawing.Size(55, 22)
+    $saveBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top
+    $saveBtn.AccessibleName = "Save console output"
+    $saveBtn.Add_Click({ Export-ConsoleOutput | Out-Null })
+    $null = $outputPanel.Controls.Add($saveBtn)
 
     $clearBtn = New-Object System.Windows.Forms.Button
     $clearBtn.Text = "Clear"
@@ -3718,10 +3886,10 @@ function Build-MainForm {
     $clearBtn.FlatAppearance.BorderColor = $Script:Theme.Border
     $clearBtn.Location = New-Object System.Drawing.Point(920, 5)
     $clearBtn.Size = New-Object System.Drawing.Size(55, 22)
-    $clearBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $clearBtn.Anchor = [System.Windows.Forms.AnchorStyles]::Top
     $clearBtn.Add_Click({ $Script:OutputBox.Clear() })
     $null = $outputPanel.Controls.Add($clearBtn)
-    
+
     $Script:OutputBox = New-Object System.Windows.Forms.RichTextBox
     $Script:OutputBox.Location = New-Object System.Drawing.Point(10, 32)
     $Script:OutputBox.Size = New-Object System.Drawing.Size(980, 140)
@@ -3734,6 +3902,15 @@ function Build-MainForm {
     $null = $outputPanel.Controls.Add($Script:OutputBox)
     
     $null = $form.Controls.Add($outputPanel)
+
+    $positionOutputActions = {
+        $rightEdge = $outputPanel.ClientSize.Width - 15
+        $clearBtn.Left = $rightEdge - $clearBtn.Width
+        $cancelBtn.Left = $clearBtn.Left - $cancelBtn.Width - 10
+        $saveBtn.Left = $cancelBtn.Left - $saveBtn.Width - 10
+    }.GetNewClosure()
+    $outputPanel.Add_SizeChanged($positionOutputActions)
+    & $positionOutputActions
     
     # Status bar
     $statusStrip = New-Object System.Windows.Forms.StatusStrip

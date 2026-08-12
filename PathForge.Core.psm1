@@ -126,6 +126,236 @@ public static class PathForgeRestartManagerNative {
 "@
 }
 
+if (-not ('PathForgeLinkNative' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public sealed class PathForgeNativeReparseInfo {
+    public uint Tag { get; set; }
+    public string SubstituteName { get; set; }
+    public string PrintName { get; set; }
+    public bool IsRelative { get; set; }
+}
+
+public static class PathForgeLinkNative {
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+    private const uint FSCTL_GET_REPARSE_POINT = 0x000900A8;
+    private const uint IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003;
+    private const uint IO_REPARSE_TAG_SYMLINK = 0xA000000C;
+    private const uint SYMLINK_FLAG_RELATIVE = 1;
+    private const int ERROR_MORE_DATA = 234;
+    private const int ERROR_HANDLE_EOF = 38;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string fileName,
+        uint desiredAccess,
+        FileShare shareMode,
+        IntPtr securityAttributes,
+        FileMode creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(
+        SafeFileHandle device,
+        uint controlCode,
+        IntPtr inputBuffer,
+        int inputBufferSize,
+        byte[] outputBuffer,
+        int outputBufferSize,
+        out int bytesReturned,
+        IntPtr overlapped);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr FindFirstFileNameW(
+        string fileName,
+        uint flags,
+        ref uint stringLength,
+        StringBuilder linkName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool FindNextFileNameW(
+        IntPtr findStream,
+        ref uint stringLength,
+        StringBuilder linkName);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FindClose(IntPtr findFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool DeleteFileW(string fileName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool RemoveDirectoryW(string pathName);
+
+    private static string DecodeUnicode(byte[] buffer, int offset, int length, int bytesReturned) {
+        if (length == 0) {
+            return String.Empty;
+        }
+        if (offset < 0 || length < 0 || offset + length > bytesReturned) {
+            throw new InvalidDataException("The reparse point contains an invalid path buffer.");
+        }
+        return Encoding.Unicode.GetString(buffer, offset, length);
+    }
+
+    private static string ToExtendedPath(string path) {
+        string fullPath = Path.GetFullPath(path);
+        if (fullPath.StartsWith("\\\\?\\", StringComparison.Ordinal)) {
+            return fullPath;
+        }
+        if (fullPath.StartsWith("\\\\", StringComparison.Ordinal)) {
+            return "\\\\?\\UNC\\" + fullPath.Substring(2);
+        }
+        return "\\\\?\\" + fullPath;
+    }
+
+    public static PathForgeNativeReparseInfo GetReparseInfo(string path) {
+        using (SafeFileHandle handle = CreateFileW(
+            ToExtendedPath(path),
+            0,
+            FileShare.Read | FileShare.Write | FileShare.Delete,
+            IntPtr.Zero,
+            FileMode.Open,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            IntPtr.Zero)) {
+            if (handle.IsInvalid) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            byte[] buffer = new byte[16 * 1024];
+            int bytesReturned;
+            if (!DeviceIoControl(
+                handle,
+                FSCTL_GET_REPARSE_POINT,
+                IntPtr.Zero,
+                0,
+                buffer,
+                buffer.Length,
+                out bytesReturned,
+                IntPtr.Zero)) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            if (bytesReturned < 8) {
+                throw new InvalidDataException("The reparse point data is shorter than its header.");
+            }
+
+            uint tag = BitConverter.ToUInt32(buffer, 0);
+            PathForgeNativeReparseInfo result = new PathForgeNativeReparseInfo();
+            result.Tag = tag;
+            result.SubstituteName = String.Empty;
+            result.PrintName = String.Empty;
+
+            if (tag == IO_REPARSE_TAG_SYMLINK) {
+                if (bytesReturned < 20) {
+                    throw new InvalidDataException("The symbolic-link reparse data is incomplete.");
+                }
+                ushort substituteOffset = BitConverter.ToUInt16(buffer, 8);
+                ushort substituteLength = BitConverter.ToUInt16(buffer, 10);
+                ushort printOffset = BitConverter.ToUInt16(buffer, 12);
+                ushort printLength = BitConverter.ToUInt16(buffer, 14);
+                uint flags = BitConverter.ToUInt32(buffer, 16);
+                result.SubstituteName = DecodeUnicode(buffer, 20 + substituteOffset, substituteLength, bytesReturned);
+                result.PrintName = DecodeUnicode(buffer, 20 + printOffset, printLength, bytesReturned);
+                result.IsRelative = (flags & SYMLINK_FLAG_RELATIVE) != 0;
+            }
+            else if (tag == IO_REPARSE_TAG_MOUNT_POINT) {
+                if (bytesReturned < 16) {
+                    throw new InvalidDataException("The mount-point reparse data is incomplete.");
+                }
+                ushort substituteOffset = BitConverter.ToUInt16(buffer, 8);
+                ushort substituteLength = BitConverter.ToUInt16(buffer, 10);
+                ushort printOffset = BitConverter.ToUInt16(buffer, 12);
+                ushort printLength = BitConverter.ToUInt16(buffer, 14);
+                result.SubstituteName = DecodeUnicode(buffer, 16 + substituteOffset, substituteLength, bytesReturned);
+                result.PrintName = DecodeUnicode(buffer, 16 + printOffset, printLength, bytesReturned);
+            }
+
+            return result;
+        }
+    }
+
+    private static string ExpandHardLinkName(string root, string linkName) {
+        if (linkName.StartsWith("\\", StringComparison.Ordinal)) {
+            return root.TrimEnd('\\') + linkName;
+        }
+        return Path.Combine(root, linkName);
+    }
+
+    public static string[] GetHardLinkNames(string path) {
+        string fullPath = Path.GetFullPath(path);
+        string root = Path.GetPathRoot(fullPath);
+        int capacity = 1024;
+        IntPtr searchHandle = new IntPtr(-1);
+        StringBuilder buffer = null;
+
+        while (true) {
+            uint length = (uint)capacity;
+            buffer = new StringBuilder(capacity);
+            searchHandle = FindFirstFileNameW(ToExtendedPath(fullPath), 0, ref length, buffer);
+            if (searchHandle != new IntPtr(-1)) {
+                break;
+            }
+            int error = Marshal.GetLastWin32Error();
+            if (error != ERROR_MORE_DATA) {
+                throw new Win32Exception(error);
+            }
+            capacity = checked((int)length + 1);
+        }
+
+        HashSet<string> names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try {
+            names.Add(ExpandHardLinkName(root, buffer.ToString()));
+            while (true) {
+                uint length = (uint)capacity;
+                buffer = new StringBuilder(capacity);
+                if (FindNextFileNameW(searchHandle, ref length, buffer)) {
+                    names.Add(ExpandHardLinkName(root, buffer.ToString()));
+                    continue;
+                }
+
+                int error = Marshal.GetLastWin32Error();
+                if (error == ERROR_HANDLE_EOF) {
+                    break;
+                }
+                if (error == ERROR_MORE_DATA) {
+                    capacity = checked((int)length + 1);
+                    continue;
+                }
+                throw new Win32Exception(error);
+            }
+        }
+        finally {
+            FindClose(searchHandle);
+        }
+        string[] result = new string[names.Count];
+        names.CopyTo(result);
+        Array.Sort(result, StringComparer.OrdinalIgnoreCase);
+        return result;
+    }
+
+    public static void DeleteFileLink(string path) {
+        if (!DeleteFileW(ToExtendedPath(path))) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static void DeleteDirectoryLink(string path) {
+        if (!RemoveDirectoryW(ToExtendedPath(path))) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+"@
+}
+
 function Test-SafePath {
     [CmdletBinding()]
     param([string]$Path)
@@ -208,11 +438,14 @@ function Move-ToRecycleBin {
     [CmdletBinding(SupportsShouldProcess)]
     param([string]$Path)
 
-    if (-not $PSCmdlet.ShouldProcess($Path, 'Move to the Recycle Bin')) {
-        return @{Success = $true; Method = 'WhatIf: Recycle Bin'; Simulated = $true }
-    }
-
     try {
+        $targetItem = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (($targetItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return @{Success = $false; Error = 'Recycle Bin is skipped for reparse points; use link-only safe deletion.' }
+        }
+        if (-not $PSCmdlet.ShouldProcess($Path, 'Move to the Recycle Bin')) {
+            return @{Success = $true; Method = 'WhatIf: Recycle Bin'; Simulated = $true }
+        }
         if (Test-Path -LiteralPath $Path -PathType Container) {
             [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
                 $Path,
@@ -389,6 +622,251 @@ function Remove-ItemWMI {
     catch { return @{Success = $false; Error = $_.Exception.Message } }
 }
 
+function ConvertFrom-PathForgeReparseTarget {
+    param(
+        [AllowNull()][string]$Target,
+        [bool]$IsRelative = $false
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Target) -or $IsRelative) {
+        return $Target
+    }
+    if ($Target.StartsWith('\??\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Target.Substring(8)
+    }
+    if ($Target.StartsWith('\??\Volume{', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return '\\?\' + $Target.Substring(4)
+    }
+    if ($Target.StartsWith('\??\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $Target.Substring(4)
+    }
+    if ($Target.StartsWith('\\?\UNC\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Target.Substring(8)
+    }
+    return $Target
+}
+
+function Get-PathForgeReparseTagName {
+    param([uint32]$Tag)
+
+    switch ('{0:X8}' -f $Tag) {
+        'A0000003' { return 'Mount Point' }
+        'A000000C' { return 'Symbolic Link' }
+        '80000007' { return 'Single Instance Storage' }
+        '80000008' { return 'WIM' }
+        '8000000A' { return 'DFS' }
+        '80000012' { return 'DFSR' }
+        '80000013' { return 'Windows Overlay Filter' }
+        '8000001B' { return 'App Execution Link' }
+        default { return 'Other Reparse Point' }
+    }
+}
+
+function Get-PathForgeLinkInfo {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return [PSCustomObject]@{Success = $false; Path = $Path; Error = $check.Reason }
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Path = $Path; Error = $_.Exception.Message }
+    }
+
+    $isDirectory = [bool]$item.PSIsContainer
+    $isReparsePoint = ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    $kind = if ($isDirectory) { 'Directory' } else { 'File' }
+    $tag = [uint32]0
+    $tagHex = $null
+    $tagName = $null
+    $target = $null
+    $rawTarget = $null
+    $isRelative = $false
+    $hardLinkPaths = @()
+    $inspectionWarning = $null
+    $isSafeLinkReparsePoint = $false
+
+    if ($isReparsePoint) {
+        try {
+            $nativeInfo = [PathForgeLinkNative]::GetReparseInfo($item.FullName)
+            $tag = [uint32]$nativeInfo.Tag
+            $tagHex = '0x{0:X8}' -f $tag
+            $tagName = Get-PathForgeReparseTagName -Tag $tag
+            $isRelative = [bool]$nativeInfo.IsRelative
+            $rawTarget = if (-not [string]::IsNullOrWhiteSpace($nativeInfo.PrintName)) {
+                [string]$nativeInfo.PrintName
+            }
+            else {
+                [string]$nativeInfo.SubstituteName
+            }
+            $target = ConvertFrom-PathForgeReparseTarget -Target $rawTarget -IsRelative $isRelative
+
+            if ($tagHex -eq '0xA000000C') {
+                $kind = if ($isDirectory) { 'Directory Symbolic Link' } else { 'File Symbolic Link' }
+            }
+            elseif ($tagHex -eq '0xA0000003') {
+                $kind = if ($target -match '^(?:\\\\\?\\)?Volume\{') { 'Volume Mount Point' } else { 'Junction' }
+            }
+            else {
+                $kind = $tagName
+            }
+            $isSafeLinkReparsePoint = $tagHex -in @('0xA0000003', '0xA000000C')
+        }
+        catch {
+            $kind = 'Unknown Reparse Point'
+            $inspectionWarning = $_.Exception.Message
+        }
+    }
+    elseif (-not $isDirectory) {
+        try {
+            $hardLinkPaths = @([PathForgeLinkNative]::GetHardLinkNames($item.FullName))
+            if ($hardLinkPaths.Count -gt 1) {
+                $kind = 'Hard Link'
+            }
+        }
+        catch {
+            $inspectionWarning = $_.Exception.Message
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success           = $true
+        Path              = $item.FullName
+        Name              = $item.Name
+        Kind              = $kind
+        IsDirectory       = $isDirectory
+        IsReparsePoint    = $isReparsePoint
+        ReparseTag        = $tag
+        ReparseTagHex     = $tagHex
+        ReparseTagName    = $tagName
+        Target            = $target
+        RawTarget         = $rawTarget
+        IsRelativeTarget  = $isRelative
+        HardLinkCount     = $hardLinkPaths.Count
+        HardLinkPaths     = $hardLinkPaths
+        CanSafeDeleteLink = $isSafeLinkReparsePoint -or $hardLinkPaths.Count -gt 1
+        Warning           = $inspectionWarning
+        Error             = $null
+    }
+}
+
+function Find-PathForgeReparsePoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateRange(1, 1000000)][int]$MaxItems = 10000,
+        [ValidateRange(0, 1024)][int]$MaxDepth = 64
+    )
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return [PSCustomObject]@{Success = $false; RootPath = $Path; Items = @(); ScannedCount = 0; Truncated = $false; Errors = @($check.Reason); Error = $check.Reason }
+    }
+
+    try {
+        $rootItem = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; RootPath = $Path; Items = @(); ScannedCount = 0; Truncated = $false; Errors = @($_.Exception.Message); Error = $_.Exception.Message }
+    }
+
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    $rootIsReparse = ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    if ($rootIsReparse) {
+        $rootInfo = Get-PathForgeLinkInfo -Path $rootItem.FullName
+        if ($rootInfo.Success) { $results.Add($rootInfo) } else { $errors.Add($rootInfo.Error) }
+        return [PSCustomObject]@{Success = $true; RootPath = $rootItem.FullName; Items = $results.ToArray(); ScannedCount = 1; Truncated = $false; Errors = $errors.ToArray(); Error = $null }
+    }
+    if (-not $rootItem.PSIsContainer) {
+        return [PSCustomObject]@{Success = $true; RootPath = $rootItem.FullName; Items = @(); ScannedCount = 1; Truncated = $false; Errors = @(); Error = $null }
+    }
+
+    $directories = New-Object 'System.Collections.Generic.Queue[object]'
+    $directories.Enqueue([PSCustomObject]@{Path = $rootItem.FullName; Depth = 0 })
+    $scannedCount = 0
+    $truncated = $false
+
+    while ($directories.Count -gt 0 -and -not $truncated) {
+        $current = $directories.Dequeue()
+        try {
+            $children = @(Get-ChildItem -LiteralPath $current.Path -Force -ErrorAction Stop)
+        }
+        catch {
+            $errors.Add("$($current.Path): $($_.Exception.Message)")
+            continue
+        }
+
+        foreach ($child in $children) {
+            $scannedCount++
+            if ($scannedCount -gt $MaxItems) {
+                $truncated = $true
+                break
+            }
+
+            $childIsReparse = ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+            if ($childIsReparse) {
+                $linkInfo = Get-PathForgeLinkInfo -Path $child.FullName
+                if ($linkInfo.Success) { $results.Add($linkInfo) } else { $errors.Add("$($child.FullName): $($linkInfo.Error)") }
+                continue
+            }
+            if ($child.PSIsContainer -and $current.Depth -lt $MaxDepth) {
+                $directories.Enqueue([PSCustomObject]@{Path = $child.FullName; Depth = $current.Depth + 1 })
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success      = $true
+        RootPath     = $rootItem.FullName
+        Items        = $results.ToArray()
+        ScannedCount = [Math]::Min($scannedCount, $MaxItems)
+        Truncated    = $truncated
+        Errors       = $errors.ToArray()
+        Error        = $null
+    }
+}
+
+function Remove-PathForgeLinkSafe {
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $info = Get-PathForgeLinkInfo -Path $Path
+    if (-not $info.Success) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Kind = $null; Error = $info.Error }
+    }
+    if (-not $info.CanSafeDeleteLink) {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $info.Path; Kind = $info.Kind; Error = 'The selected path is not a reparse point or a file with multiple hard links.' }
+    }
+
+    $action = if ($info.IsReparsePoint) { 'Remove the link without traversing its target' } else { 'Remove only this hard-link directory entry' }
+    if (-not $PSCmdlet.ShouldProcess($info.Path, $action)) {
+        return [PSCustomObject]@{Success = $true; Simulated = $true; Path = $info.Path; Kind = $info.Kind; Error = $null }
+    }
+
+    try {
+        if ($info.IsDirectory) {
+            [PathForgeLinkNative]::DeleteDirectoryLink($info.Path)
+        }
+        else {
+            [PathForgeLinkNative]::DeleteFileLink($info.Path)
+        }
+        $remainingItem = Get-Item -LiteralPath $info.Path -Force -ErrorAction SilentlyContinue
+        if ($remainingItem) {
+            return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $info.Path; Kind = $info.Kind; Error = 'Windows reported success but the selected link still exists.' }
+        }
+        return [PSCustomObject]@{Success = $true; Simulated = $false; Path = $info.Path; Kind = $info.Kind; Error = $null }
+    }
+    catch {
+        return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $info.Path; Kind = $info.Kind; Error = $_.Exception.Message }
+    }
+}
+
 function Test-ReparsePoint {
     [CmdletBinding()]
     param([string]$Path)
@@ -404,14 +882,15 @@ function Remove-ReparsePointSafe {
     [CmdletBinding(SupportsShouldProcess)]
     param([string]$Path)
 
-    if (Test-ReparsePoint -Path $Path) {
-        if (-not $PSCmdlet.ShouldProcess($Path, 'Remove the reparse point without traversing its target')) {
-            return $true
-        }
-        $null = Start-Process -FilePath "cmd.exe" -ArgumentList '/c', "rmdir `"$Path`"" -NoNewWindow -Wait -PassThru 2>$null
-        return -not (Test-Path -LiteralPath $Path)
+    $info = Get-PathForgeLinkInfo -Path $Path
+    if (-not $info.Success -or -not $info.IsReparsePoint) {
+        return $false
     }
-    return $false
+    if (-not $PSCmdlet.ShouldProcess($info.Path, 'Remove the reparse point without traversing its target')) {
+        return $true
+    }
+    $result = Remove-PathForgeLinkSafe -Path $info.Path -Confirm:$false
+    return [bool]$result.Success
 }
 
 function Register-BootTimeDelete {
@@ -769,8 +1248,10 @@ function Get-PathForgeDeletionPlan {
     if ($TakeOwnership) {
         $null = & $addMethod 'Take Ownership' 'takeown.exe + icacls.exe' $true 'Requested prerequisite before permanent deletion'
     }
-    $null = & $addMethod 'Recycle Bin' 'Microsoft.VisualBasic.FileIO.FileSystem' ([bool]$IncludeRecycleBin) $(if ($IncludeRecycleBin) { 'Enabled as the first recoverable attempt' } else { 'Recycle Bin option is disabled' }) $true
-    $null = & $addMethod 'Reparse Point Removal' 'cmd.exe rmdir (link only)' $isReparsePoint $(if ($isReparsePoint) { 'Target is a reparse point; remove the link without traversing it' } else { 'Target is not a reparse point' })
+    $recycleApplicable = [bool]$IncludeRecycleBin -and -not $isReparsePoint
+    $recycleReason = if ($isReparsePoint) { 'Skipped for reparse points; inspect and remove the link only' } elseif ($IncludeRecycleBin) { 'Enabled as the first recoverable attempt' } else { 'Recycle Bin option is disabled' }
+    $null = & $addMethod 'Recycle Bin' 'Microsoft.VisualBasic.FileIO.FileSystem' $recycleApplicable $recycleReason $true
+    $null = & $addMethod 'Reparse Point Removal' 'DeleteFileW / RemoveDirectoryW (link only)' $isReparsePoint $(if ($isReparsePoint) { 'Target is a reparse point; remove recognized links without traversing them' } else { 'Target is not a reparse point' })
 
     $permanentReason = if ($isReparsePoint) { 'Skipped unless safe link-only removal is declined' } else { 'Applicable permanent deletion attempt' }
     $permanentApplicable = -not $isReparsePoint
@@ -986,11 +1467,11 @@ function Invoke-PathForgeDeletionMethod {
     }
 
     $attemptNames = New-Object 'System.Collections.Generic.List[string]'
-    if ($IncludeRecycleBin) { $attemptNames.Add('RecycleBin') }
     if (Test-ReparsePoint -Path $Path) {
         $attemptNames.Add('ReparsePoint')
     }
     else {
+        if ($IncludeRecycleBin) { $attemptNames.Add('RecycleBin') }
         foreach ($attemptName in @('Standard', 'DotNet', 'LongPath')) { $attemptNames.Add($attemptName) }
         if ((Get-VolumeFileSystem -Path $Path) -eq 'NTFS') { $attemptNames.Add('ShortName') }
         if (Test-Path -LiteralPath $Path -PathType Container) { $attemptNames.Add('Robocopy') }
@@ -1465,6 +1946,9 @@ Export-ModuleMember -Function @(
     'Remove-ItemRobocopy',
     'Remove-ItemWMI',
     'Test-ReparsePoint',
+    'Get-PathForgeLinkInfo',
+    'Find-PathForgeReparsePoint',
+    'Remove-PathForgeLinkSafe',
     'Remove-ReparsePointSafe',
     'Register-BootTimeDelete',
     'Get-PathForgePendingFileQueue',

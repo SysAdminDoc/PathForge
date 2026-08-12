@@ -673,14 +673,15 @@ HARD LINKS
 • Multiple directory entries → same data
 • Command: mklink /H LinkName Target
 
-DANGERS OF DELETION:
-Regular deletion follows the link and DELETES THE TARGET!
-• "del symlink" deletes target file
-• "rmdir /s junction" deletes target folder contents!
+DELETION SAFETY:
+- DeleteFile removes a file symlink itself, not its target.
+- RemoveDirectory removes a directory symlink or junction itself, not its target.
+- Recursive tools remain dangerous if they enumerate through a link before removing it.
 
-SAFE DELETION:
-• rmdir linkname (without /s) - removes link only
-• fsutil reparsepoint delete linkname
+PATHFORGE SAFE DELETION:
+- Reads the reparse tag and target through FSCTL_GET_REPARSE_POINT.
+- Uses DeleteFile or RemoveDirectory only on a path re-inspected as a link.
+- Never applies recursive deletion to a link target.
 
 IDENTIFICATION:
 • dir shows <SYMLINK>, <JUNCTION>, <SYMLINKD>
@@ -693,7 +694,7 @@ COMMON USES:
 • Developer: node_modules symlink to shared cache
 
 PATHFORGE BEHAVIOR:
-When detecting a reparse point, we ask before deletion to prevent accidentally destroying target data.
+The Link Inspector identifies junctions, symbolic links, and hard-link sibling names. The Reparse Explorer scans without descending into discovered links. Link-only deletion requires confirmation and leaves target data reachable through its canonical path or remaining hard-link names.
 "@
     }
 }
@@ -962,6 +963,35 @@ function Invoke-ForceDelete {
         Write-Log "Locking process detected: $($locker.ProcessName) (PID $($locker.ProcessId)) for $Path" -Level "WARN"
     }
 
+    if (Test-ReparsePoint -Path $Path) {
+        $linkInfo = Get-PathForgeLinkInfo -Path $Path
+        if (-not $linkInfo.Success -or -not $linkInfo.CanSafeDeleteLink) {
+            $reason = if ($linkInfo.Error) { $linkInfo.Error } else { "Tag $($linkInfo.ReparseTagHex) is not a recognized junction or symbolic link" }
+            Write-Console "Refusing generic deletion of reparse point: $reason" -Type "Error"
+            Write-Console "Use Link Inspector to review this object; recursive methods will not run." -Type "Warning"
+            return $false
+        }
+
+        Write-Console "Detected $($linkInfo.Kind): $($linkInfo.Path)" -Type "Warning"
+        Write-Console "Target: $($linkInfo.Target)" -Type "Info"
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "Remove only this $($linkInfo.Kind)?`n`nLink: $($linkInfo.Path)`nTarget (will remain untouched): $($linkInfo.Target)",
+            "Link Detected", 4, 48)
+        if ($result -ne 6) {
+            Write-Console "Link deletion cancelled; no fallback method was run" -Type "Warning"
+            return $false
+        }
+
+        $linkResult = Remove-PathForgeLinkSafe -Path $Path -Confirm:$false
+        if ($linkResult.Success) {
+            Write-Console "Link removed without traversing its target" -Type "Success"
+            Write-Log "Link-only deletion succeeded: $Path" -Level "SUCCESS"
+            return $true
+        }
+        Write-Console "Link-only deletion failed: $($linkResult.Error)" -Type "Error"
+        return $false
+    }
+
     if ($Script:RecycleBinCheck -and $Script:RecycleBinCheck.Checked) {
         Write-Console "  Attempting Recycle Bin (recoverable)..." -Type "Progress"
         $rbResult = Move-ToRecycleBin -Path $Path
@@ -972,19 +1002,6 @@ function Invoke-ForceDelete {
             return $true
         }
         Write-Console "  Recycle Bin failed: $($rbResult.Error) -- escalating to permanent delete" -Type "Warning"
-    }
-
-    if (Test-ReparsePoint -Path $Path) {
-        Write-Console "Detected symbolic link or junction point" -Type "Warning"
-        $result = [System.Windows.Forms.MessageBox]::Show(
-            "This is a symbolic link or junction. Remove link only (not target)?",
-            "Reparse Point Detected", 4, 48)
-        if ($result -eq 6) {
-            if (Remove-ReparsePointSafe -Path $Path) {
-                Write-Console "Reparse point removed successfully" -Type "Success"
-                return $true
-            }
-        }
     }
     
     if ($TakeOwnership) {
@@ -1826,6 +1843,444 @@ function Show-PendingDeletionQueue {
     else {
         [void]$dialog.ShowDialog()
     }
+    $dialog.Dispose()
+}
+
+# ============================================================================
+# LINK INSPECTION & REPARSE EXPLORER
+# ============================================================================
+function Show-LinkInspector {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $info = Get-PathForgeLinkInfo -Path $Path
+    if (-not $info.Success) {
+        [System.Windows.Forms.MessageBox]::Show("Unable to inspect the selected path:`n`n$($info.Error)", "Link Inspection Failed", 0, 16) | Out-Null
+        return
+    }
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Link Inspector"
+    $dialog.Size = New-Object System.Drawing.Size(820, 590)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(700, 520)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.ShowIcon = $false
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = $info.Kind
+    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 16)
+    $titleLabel.ForeColor = if ($info.CanSafeDeleteLink) { $Script:Theme.Info } else { $Script:Theme.TextPrimary }
+    $titleLabel.AutoSize = $true
+    $titleLabel.Location = New-Object System.Drawing.Point(20, 18)
+    $null = $dialog.Controls.Add($titleLabel)
+
+    $pathBox = New-Object System.Windows.Forms.Label
+    $pathBox.Name = "InspectedPathLabel"
+    $pathBox.Text = $info.Path
+    $pathBox.AccessibleName = "Inspected path"
+    $pathBox.BackColor = $Script:Theme.BgInput
+    $pathBox.ForeColor = $Script:Theme.TextSecondary
+    $pathBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $pathBox.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $pathBox.AutoEllipsis = $true
+    $pathBox.Location = New-Object System.Drawing.Point(22, 58)
+    $pathBox.Size = New-Object System.Drawing.Size(760, 26)
+    $pathBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $null = $dialog.Controls.Add($pathBox)
+
+    $detailsGrid = New-Object System.Windows.Forms.DataGridView
+    $detailsGrid.Name = "LinkDetailsGrid"
+    $detailsGrid.AccessibleName = "Link metadata"
+    $detailsGrid.Location = New-Object System.Drawing.Point(22, 98)
+    $detailsGrid.Size = New-Object System.Drawing.Size(760, 190)
+    $detailsGrid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $detailsGrid.BackgroundColor = $Script:Theme.BgInput
+    $detailsGrid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $detailsGrid.GridColor = $Script:Theme.Border
+    $detailsGrid.EnableHeadersVisualStyles = $false
+    $detailsGrid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $detailsGrid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $detailsGrid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $detailsGrid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $detailsGrid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $detailsGrid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $detailsGrid.RowHeadersVisible = $false
+    $detailsGrid.AllowUserToAddRows = $false
+    $detailsGrid.AllowUserToDeleteRows = $false
+    $detailsGrid.AllowUserToResizeRows = $false
+    $detailsGrid.ReadOnly = $true
+    $detailsGrid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $propertyColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $propertyColumn.HeaderText = "Property"
+    $propertyColumn.Width = 145
+    $propertyColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $null = $detailsGrid.Columns.Add($propertyColumn)
+    $valueColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $valueColumn.HeaderText = "Value"
+    $valueColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    $valueColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::NotSortable
+    $null = $detailsGrid.Columns.Add($valueColumn)
+
+    $tagDisplay = if ($info.IsReparsePoint) { "$($info.ReparseTagHex) - $($info.ReparseTagName)" } else { "Not a reparse point" }
+    $targetDisplay = if ([string]::IsNullOrWhiteSpace($info.Target)) { "(none or opaque reparse data)" } else { [string]$info.Target }
+    $hardLinkDisplay = if ($info.IsDirectory) { "Not applicable to directories" } else { "$($info.HardLinkCount) name(s)" }
+    $null = $detailsGrid.Rows.Add("Path", $info.Path)
+    $null = $detailsGrid.Rows.Add("Type", $info.Kind)
+    $null = $detailsGrid.Rows.Add("Reparse tag", $tagDisplay)
+    $null = $detailsGrid.Rows.Add("Target", $targetDisplay)
+    $null = $detailsGrid.Rows.Add("Relative target", $(if ($info.IsRelativeTarget) { "Yes" } else { "No" }))
+    $null = $detailsGrid.Rows.Add("Hard-link count", $hardLinkDisplay)
+    $detailsGrid.ClearSelection()
+    $null = $dialog.Controls.Add($detailsGrid)
+
+    $namesLabel = New-Object System.Windows.Forms.Label
+    $namesLabel.Text = "HARD-LINK NAMES"
+    $namesLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 8)
+    $namesLabel.ForeColor = $Script:Theme.TextMuted
+    $namesLabel.AutoSize = $true
+    $namesLabel.Location = New-Object System.Drawing.Point(22, 304)
+    $null = $dialog.Controls.Add($namesLabel)
+
+    $namesList = New-Object System.Windows.Forms.ListBox
+    $namesList.Name = "HardLinkNamesList"
+    $namesList.AccessibleName = "Hard-link names"
+    $namesList.Location = New-Object System.Drawing.Point(22, 328)
+    $namesList.Size = New-Object System.Drawing.Size(760, 96)
+    $namesList.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $namesList.BackColor = $Script:Theme.BgInput
+    $namesList.ForeColor = $Script:Theme.TextSecondary
+    $namesList.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    if ($info.HardLinkCount -gt 0) {
+        foreach ($linkName in $info.HardLinkPaths) { $null = $namesList.Items.Add($linkName) }
+    }
+    else {
+        $null = $namesList.Items.Add("No hard-link names to enumerate for this object")
+    }
+    $null = $dialog.Controls.Add($namesList)
+
+    $safetyLabel = New-Object System.Windows.Forms.Label
+    $safetyLabel.Text = if ($info.CanSafeDeleteLink) {
+        "Safe delete removes only the selected link/name. It never recursively enters the displayed target."
+    }
+    else {
+        "This is an ordinary file or directory, so link-only deletion is disabled."
+    }
+    $safetyLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $safetyLabel.ForeColor = if ($info.CanSafeDeleteLink) { $Script:Theme.Success } else { $Script:Theme.TextMuted }
+    $safetyLabel.AutoSize = $true
+    $safetyLabel.Location = New-Object System.Drawing.Point(22, 442)
+    $null = $dialog.Controls.Add($safetyLabel)
+
+    if (-not [string]::IsNullOrWhiteSpace($info.Warning)) {
+        $safetyLabel.Text = "$($safetyLabel.Text) Inspection warning: $($info.Warning)"
+        $safetyLabel.ForeColor = $Script:Theme.Warning
+    }
+
+    $dryRun = [bool]($Script:DryRunCheck -and $Script:DryRunCheck.Checked)
+    $removeButton = New-Object System.Windows.Forms.Button
+    $removeButton.Text = if ($dryRun) { "Preview Safe Delete" } else { "Safe Delete Link" }
+    $removeButton.AccessibleName = $removeButton.Text
+    $removeButton.Location = New-Object System.Drawing.Point(510, 494)
+    $removeButton.Size = New-Object System.Drawing.Size(140, 36)
+    $removeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $removeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $removeButton.FlatAppearance.BorderColor = $Script:Theme.Warning
+    $removeButton.BackColor = $Script:Theme.BgTertiary
+    $removeButton.ForeColor = $Script:Theme.Warning
+    $removeButton.Enabled = [bool]$info.CanSafeDeleteLink
+    $null = $dialog.Controls.Add($removeButton)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.AccessibleName = "Close link inspector"
+    $closeButton.Location = New-Object System.Drawing.Point(662, 494)
+    $closeButton.Size = New-Object System.Drawing.Size(120, 36)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $closeButton.BackColor = $Script:Theme.AccentDim
+    $closeButton.ForeColor = $Script:Theme.TextPrimary
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.CancelButton = $closeButton
+    $null = $dialog.Controls.Add($closeButton)
+
+    $inspectedInfo = $info
+    $removeButton.Add_Click({
+        if (-not $dryRun) {
+            $impactText = if ($inspectedInfo.IsReparsePoint) {
+                "The link will be removed. Its target will not be traversed or deleted:`n$($inspectedInfo.Target)"
+            }
+            else {
+                "Only this hard-link name will be removed. $($inspectedInfo.HardLinkCount - 1) other name(s) will continue to reference the data."
+            }
+            $confirmation = [System.Windows.Forms.MessageBox]::Show($dialog, "$impactText`n`nContinue?", "Confirm Link-Only Delete", 4, 48)
+            if ($confirmation -ne 6) { return }
+        }
+
+        $result = Remove-PathForgeLinkSafe -Path $inspectedInfo.Path -WhatIf:$dryRun -Confirm:$false
+        if ($result.Success -and $result.Simulated) {
+            Write-Console "[DRY-RUN] Would safely remove $($inspectedInfo.Kind): $($inspectedInfo.Path)" -Type "Info"
+            [System.Windows.Forms.MessageBox]::Show($dialog, "Dry-run complete. The link and target were not changed.", "Safe Delete Preview", 0, 64) | Out-Null
+        }
+        elseif ($result.Success) {
+            Write-Console "Safely removed $($inspectedInfo.Kind): $($inspectedInfo.Path)" -Type "Success"
+            Write-Log "Link-only deletion succeeded: kind=$($inspectedInfo.Kind) path=$($inspectedInfo.Path)" -Level "SUCCESS"
+            [System.Windows.Forms.MessageBox]::Show($dialog, "The selected link/name was removed. Target data was not traversed.", "Link Removed", 0, 64) | Out-Null
+            $dialog.Close()
+        }
+        else {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $result.Error, "Safe Delete Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) { [void]$dialog.ShowDialog($owner) } else { [void]$dialog.ShowDialog() }
+    $dialog.Dispose()
+}
+
+function Show-ReparsePointExplorer {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "Reparse Point Explorer"
+    $dialog.Size = New-Object System.Drawing.Size(1000, 640)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(820, 520)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $dialog.MinimizeBox = $false
+    $dialog.MaximizeBox = $false
+    $dialog.ShowIcon = $false
+
+    $titleLabel = New-Object System.Windows.Forms.Label
+    $titleLabel.Text = "Reparse points (non-traversing scan)"
+    $titleLabel.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 15)
+    $titleLabel.ForeColor = $Script:Theme.TextPrimary
+    $titleLabel.AutoSize = $true
+    $titleLabel.Location = New-Object System.Drawing.Point(20, 16)
+    $null = $dialog.Controls.Add($titleLabel)
+
+    $rootBox = New-Object System.Windows.Forms.Label
+    $rootBox.Name = "ReparseScanRootLabel"
+    $rootBox.Text = $Path
+    $rootBox.AccessibleName = "Reparse scan root"
+    $rootBox.BackColor = $Script:Theme.BgInput
+    $rootBox.ForeColor = $Script:Theme.TextSecondary
+    $rootBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $rootBox.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $rootBox.AutoEllipsis = $true
+    $rootBox.Location = New-Object System.Drawing.Point(22, 52)
+    $rootBox.Size = New-Object System.Drawing.Size(940, 26)
+    $rootBox.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $null = $dialog.Controls.Add($rootBox)
+
+    $summaryLabel = New-Object System.Windows.Forms.Label
+    $summaryLabel.Text = "Waiting to scan..."
+    $summaryLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $summaryLabel.ForeColor = $Script:Theme.Info
+    $summaryLabel.AutoSize = $true
+    $summaryLabel.Location = New-Object System.Drawing.Point(22, 84)
+    $null = $dialog.Controls.Add($summaryLabel)
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "ReparseExplorerGrid"
+    $grid.AccessibleName = "Discovered reparse points"
+    $grid.Location = New-Object System.Drawing.Point(20, 110)
+    $grid.Size = New-Object System.Drawing.Size(942, 426)
+    $grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $grid.BackgroundColor = $Script:Theme.BgInput
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $grid.GridColor = $Script:Theme.Border
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = $Script:Theme.BgTertiary
+    $grid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $grid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $grid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $grid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $grid.RowHeadersVisible = $false
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.ReadOnly = $true
+    $grid.MultiSelect = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.AutoGenerateColumns = $false
+
+    $kindColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $kindColumn.Name = "LinkKind"
+    $kindColumn.HeaderText = "Type"
+    $kindColumn.Width = 155
+    $kindColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    $null = $grid.Columns.Add($kindColumn)
+    $tagColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $tagColumn.Name = "ReparseTag"
+    $tagColumn.HeaderText = "Tag"
+    $tagColumn.Width = 105
+    $tagColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    $null = $grid.Columns.Add($tagColumn)
+    $pathColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $pathColumn.Name = "LinkPath"
+    $pathColumn.HeaderText = "Path"
+    $pathColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    $pathColumn.FillWeight = 55
+    $pathColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    $null = $grid.Columns.Add($pathColumn)
+    $targetColumn = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+    $targetColumn.Name = "LinkTarget"
+    $targetColumn.HeaderText = "Target"
+    $targetColumn.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill
+    $targetColumn.FillWeight = 45
+    $targetColumn.SortMode = [System.Windows.Forms.DataGridViewColumnSortMode]::Automatic
+    $null = $grid.Columns.Add($targetColumn)
+    $null = $dialog.Controls.Add($grid)
+
+    $refreshButton = New-Object System.Windows.Forms.Button
+    $refreshButton.Text = "Rescan"
+    $refreshButton.AccessibleName = "Rescan reparse points"
+    $refreshButton.Location = New-Object System.Drawing.Point(20, 550)
+    $refreshButton.Size = New-Object System.Drawing.Size(90, 34)
+    $refreshButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left
+    $refreshButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $refreshButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $refreshButton.BackColor = $Script:Theme.BgTertiary
+    $refreshButton.ForeColor = $Script:Theme.TextSecondary
+    $null = $dialog.Controls.Add($refreshButton)
+
+    $exportButton = New-Object System.Windows.Forms.Button
+    $exportButton.Text = "Export CSV"
+    $exportButton.AccessibleName = "Export reparse point report"
+    $exportButton.Location = New-Object System.Drawing.Point(650, 550)
+    $exportButton.Size = New-Object System.Drawing.Size(100, 34)
+    $exportButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $exportButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $exportButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $exportButton.BackColor = $Script:Theme.BgTertiary
+    $exportButton.ForeColor = $Script:Theme.TextSecondary
+    $exportButton.Enabled = $false
+    $null = $dialog.Controls.Add($exportButton)
+
+    $inspectButton = New-Object System.Windows.Forms.Button
+    $inspectButton.Text = "Inspect Selected"
+    $inspectButton.AccessibleName = "Inspect selected reparse point"
+    $inspectButton.Location = New-Object System.Drawing.Point(758, 550)
+    $inspectButton.Size = New-Object System.Drawing.Size(120, 34)
+    $inspectButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $inspectButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $inspectButton.FlatAppearance.BorderColor = $Script:Theme.Info
+    $inspectButton.BackColor = $Script:Theme.BgTertiary
+    $inspectButton.ForeColor = $Script:Theme.Info
+    $inspectButton.Enabled = $false
+    $null = $dialog.Controls.Add($inspectButton)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.AccessibleName = "Close reparse point explorer"
+    $closeButton.Location = New-Object System.Drawing.Point(886, 550)
+    $closeButton.Size = New-Object System.Drawing.Size(76, 34)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $closeButton.BackColor = $Script:Theme.AccentDim
+    $closeButton.ForeColor = $Script:Theme.TextPrimary
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dialog.CancelButton = $closeButton
+    $null = $dialog.Controls.Add($closeButton)
+
+    $explorerInfoColor = $Script:Theme.Info
+    $explorerWarningColor = $Script:Theme.Warning
+    $explorerErrorColor = $Script:Theme.Error
+    $reportDirectory = $Script:Config.LogPath
+    $scanRoot = $Path
+
+    $loadResults = {
+        $grid.Rows.Clear()
+        $inspectButton.Enabled = $false
+        $exportButton.Enabled = $false
+        $summaryLabel.Text = "Scanning without traversing any discovered reparse point..."
+        $summaryLabel.ForeColor = $explorerInfoColor
+        $dialog.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        [System.Windows.Forms.Application]::DoEvents()
+
+        try {
+            $report = Find-PathForgeReparsePoint -Path $scanRoot
+        }
+        catch {
+            $report = [PSCustomObject]@{Success = $false; Items = @(); Error = $_.Exception.Message; Errors = @($_.Exception.Message) }
+        }
+        finally {
+            $dialog.Cursor = [System.Windows.Forms.Cursors]::Default
+        }
+        $dialog.Tag = $report
+
+        if (-not $report.Success) {
+            $summaryLabel.Text = "Scan failed: $($report.Error)"
+            $summaryLabel.ForeColor = $explorerErrorColor
+            return
+        }
+
+        foreach ($linkInfo in @($report.Items)) {
+            $targetText = if ([string]::IsNullOrWhiteSpace($linkInfo.Target)) { "(opaque or no target)" } else { [string]$linkInfo.Target }
+            $rowIndex = $grid.Rows.Add($linkInfo.Kind, $linkInfo.ReparseTagHex, $linkInfo.Path, $targetText)
+            $grid.Rows[$rowIndex].Tag = $linkInfo
+            if (-not [string]::IsNullOrWhiteSpace($linkInfo.Warning)) {
+                $grid.Rows[$rowIndex].DefaultCellStyle.ForeColor = $explorerWarningColor
+            }
+        }
+
+        $suffix = if ($report.Truncated) { "; result limit reached" } else { "" }
+        $summaryLabel.Text = "$($report.Items.Count) reparse point(s) found; $($report.ScannedCount) item(s) examined; $($report.Errors.Count) access/read error(s)$suffix"
+        $summaryLabel.ForeColor = if ($report.Truncated -or $report.Errors.Count -gt 0) { $explorerWarningColor } else { $explorerInfoColor }
+        $exportButton.Enabled = $report.Items.Count -gt 0
+        if ($grid.Rows.Count -gt 0) { $grid.ClearSelection() }
+    }.GetNewClosure()
+
+    $inspectSelected = {
+        if ($grid.SelectedRows.Count -eq 0) { return }
+        $selectedInfo = $grid.SelectedRows[0].Tag
+        if ($selectedInfo) {
+            Show-LinkInspector -Path $selectedInfo.Path
+            & $loadResults
+        }
+    }.GetNewClosure()
+
+    $grid.Add_SelectionChanged({
+        $inspectButton.Enabled = $grid.SelectedRows.Count -gt 0
+    }.GetNewClosure())
+    $grid.Add_CellDoubleClick({ & $inspectSelected }.GetNewClosure())
+    $inspectButton.Add_Click({ & $inspectSelected }.GetNewClosure())
+    $refreshButton.Add_Click({ & $loadResults }.GetNewClosure())
+    $exportButton.Add_Click({
+        $report = $dialog.Tag
+        if (-not $report -or $report.Items.Count -eq 0) { return }
+        try {
+            if (-not (Test-Path -LiteralPath $reportDirectory)) {
+                New-Item -Path $reportDirectory -ItemType Directory -Force | Out-Null
+            }
+            $exportPath = Join-Path $reportDirectory "ReparsePoints_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+            $report.Items | Select-Object Path, Kind, ReparseTagHex, ReparseTagName, Target, IsRelativeTarget, Warning |
+                Export-Csv -LiteralPath $exportPath -NoTypeInformation -Encoding UTF8
+            Write-Console "Reparse point report exported: $exportPath" -Type "Success"
+            Write-Log "Reparse point report exported: $exportPath" -Level "SUCCESS"
+            [System.Windows.Forms.MessageBox]::Show($dialog, "Report saved to:`n$exportPath", "Export Complete", 0, 64) | Out-Null
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, "Export Failed", 0, 16) | Out-Null
+        }
+    }.GetNewClosure())
+    $dialog.Add_Shown({ & $loadResults }.GetNewClosure())
+
+    Write-Console "Opening non-traversing reparse point explorer for $Path" -Type "Info"
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) { [void]$dialog.ShowDialog($owner) } else { [void]$dialog.ShowDialog() }
     $dialog.Dispose()
 }
 
@@ -3134,6 +3589,24 @@ function Build-FileOpsPage {
 
     $card4 = New-ToolCard -Title "Batch Delete" -Desc "Load CSV or text rows and select Auto or a specific API per path" -BtnText "Load Batch..." -X 30 -Y $y -OnClick { Show-DeletionBatchDialog }
     $null = $page.Controls.Add($card4)
+
+    $card4b = New-ToolCard -Title "Link Inspector" -Desc "Identify junctions, symlinks, hard links, tags, targets, and sibling names" -BtnText "Inspect Link" -X 320 -Y $y -OnClick {
+        if ([string]::IsNullOrWhiteSpace($Script:PathTextBox.Text)) {
+            [System.Windows.Forms.MessageBox]::Show("Enter a path first.", "No Path", 0, 48) | Out-Null
+            return
+        }
+        Show-LinkInspector -Path $Script:PathTextBox.Text
+    }
+    $null = $page.Controls.Add($card4b)
+
+    $card4c = New-ToolCard -Title "Reparse Explorer" -Desc "Scan a tree for reparse types, tags, and targets without following links" -BtnText "Scan Links" -X 610 -Y $y -OnClick {
+        if ([string]::IsNullOrWhiteSpace($Script:PathTextBox.Text)) {
+            [System.Windows.Forms.MessageBox]::Show("Enter a path first.", "No Path", 0, 48) | Out-Null
+            return
+        }
+        Show-ReparsePointExplorer -Path $Script:PathTextBox.Text
+    }
+    $null = $page.Controls.Add($card4c)
     $y += 130
     
     # ========== BOOT DELETE INFO PANEL ==========

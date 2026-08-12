@@ -18,6 +18,8 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 - **Lock-Holder Identification** — Uses Windows Restart Manager to report the process and PID holding a target open before deletion
 - **Boot-Time Deletion** — Schedule stubborn files for removal on next restart via MoveFileEx API
 - **Scheduled Queue Editor** — Review delete/move pairs and cancel selected next-boot operations without clearing unrelated entries
+- **Link Inspector** — Identify junctions, symbolic links, hard-link sibling names, native reparse tags, and targets
+- **Reparse Explorer** — Scan trees without descending into links, inspect results, and export a CSV report
 - **Take Ownership** — Seize control of protected system files with one click
 - **Permission Reset** — Restore inheritance and remove explicit deny entries
 - **Orphaned SID Cleanup** — Identify and remove permissions for deleted accounts
@@ -126,6 +128,12 @@ C:\Temp\remove-at-boot.sys,BootTime,false
 
 Text files use `path|method|dry-run`; method and dry-run are optional. Supported methods are `Auto`, `Standard`, `DotNet`, `LongPath`, `ShortName`, `Robocopy`, `WMI`, `RecycleBin`, `BootTime`, and `ReparsePoint`. PathForge previews every row and asks once before processing any mutating row.
 
+### Link Safety
+
+Use **Link Inspector** on a file or directory to distinguish ordinary objects, hard links, symbolic links, junctions, and volume mount points. For hard links, every sibling name is listed. **Safe Delete Link** re-inspects the object immediately before deletion and removes only the selected directory entry; it refuses ordinary files/directories and opaque reparse-point types. Dry-run mode previews this action without changing the link.
+
+Use **Reparse Explorer** on a directory to list reparse type, native tag, path, and target. Its iterative scan never enqueues a discovered reparse-point directory, so target trees are not traversed. Results can be inspected individually or exported to CSV.
+
 ### Repair Sequence
 For corrupted systems, run repairs in this order:
 
@@ -197,6 +205,9 @@ PathForge includes detailed explanations accessible via **ℹ️ Show Details** 
 ### APIs Used
 - **DwmSetWindowAttribute** — Dark mode title bar (Windows 10 1809+)
 - **MoveFileEx** — Boot-time deletion scheduling (MOVEFILE_DELAY_UNTIL_REBOOT)
+- **FSCTL_GET_REPARSE_POINT** — Native reparse tag and target inspection without following the link
+- **FindFirstFileNameW / FindNextFileNameW** — Enumerate every hard-link name
+- **DeleteFileW / RemoveDirectoryW** — Remove only a recognized link or hard-link name without recursive traversal
 - **WMI/CIM** — Disk queries, SMART data, file operations
 
 ### Key Techniques

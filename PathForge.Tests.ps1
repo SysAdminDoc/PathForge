@@ -33,7 +33,8 @@ Describe "PathForge.Core module boundary" {
         foreach ($commandName in @(
                 'Test-SafePath', 'Remove-ItemStandard', 'Get-DriveSmartHealth',
                 'Get-PathForgeRepairCommand', 'Get-PathForgeDriveHealth',
-                'Get-PathForgePendingFileQueue', 'Remove-PathForgePendingFileOperation')) {
+                'Get-PathForgePendingFileQueue', 'Remove-PathForgePendingFileOperation',
+                'Get-PathForgeLinkInfo', 'Find-PathForgeReparsePoint', 'Remove-PathForgeLinkSafe')) {
             (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
         }
     }
@@ -311,6 +312,87 @@ Describe "PathForge.Core module boundary" {
         $result.Success | Should -BeTrue
         $result.Simulated | Should -BeTrue
         Should -Invoke Write-PathForgePendingFileRegistryValue -ModuleName PathForge.Core -Times 0
+    }
+
+    It "inspects and removes a hard-link name without deleting shared data" {
+        $originalPath = Join-Path $TestDrive 'hardlink-original.txt'
+        $linkPath = Join-Path $TestDrive 'hardlink-second-name.txt'
+        Set-Content -LiteralPath $originalPath -Value 'shared hard-link content'
+        New-Item -ItemType HardLink -Path $linkPath -Target $originalPath | Out-Null
+
+        $info = Get-PathForgeLinkInfo -Path $linkPath
+
+        $info.Success | Should -BeTrue
+        $info.Kind | Should -Be 'Hard Link'
+        $info.IsReparsePoint | Should -BeFalse
+        $info.HardLinkCount | Should -Be 2
+        $info.HardLinkPaths | Should -Contain $originalPath
+        $info.HardLinkPaths | Should -Contain $linkPath
+
+        $result = Remove-PathForgeLinkSafe -Path $linkPath -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        Test-Path -LiteralPath $linkPath | Should -BeFalse
+        Test-Path -LiteralPath $originalPath | Should -BeTrue
+        Get-Content -LiteralPath $originalPath | Should -Be 'shared hard-link content'
+    }
+
+    It "inspects and safely removes a junction without traversing its target" {
+        $targetPath = Join-Path $TestDrive 'junction-target'
+        $scanRoot = Join-Path $TestDrive 'junction-scan'
+        $junctionPath = Join-Path $scanRoot 'target-link'
+        New-Item -ItemType Directory -Path $targetPath, $scanRoot | Out-Null
+        Set-Content -LiteralPath (Join-Path $targetPath 'keep.txt') -Value 'do not traverse'
+        New-Item -ItemType Junction -Path $junctionPath -Target $targetPath | Out-Null
+
+        $info = Get-PathForgeLinkInfo -Path $junctionPath
+        $report = Find-PathForgeReparsePoint -Path $scanRoot
+        $plan = Get-PathForgeDeletionPlan -Path $junctionPath -IncludeRecycleBin
+        $recycleResult = Move-ToRecycleBin -Path $junctionPath -Confirm:$false
+
+        $info.Success | Should -BeTrue
+        $info.Kind | Should -Be 'Junction'
+        $info.ReparseTagHex | Should -Be '0xA0000003'
+        $info.Target | Should -Be $targetPath
+        $report.Success | Should -BeTrue
+        $report.Items.Count | Should -Be 1
+        $report.ScannedCount | Should -Be 1
+        ($plan.Methods | Where-Object Name -eq 'Recycle Bin').Applicable | Should -BeFalse
+        $recycleResult.Success | Should -BeFalse
+        $recycleResult.Error | Should -Match 'skipped for reparse points'
+        Get-Item -LiteralPath $junctionPath -Force | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $targetPath 'keep.txt') | Should -BeTrue
+
+        $result = Remove-PathForgeLinkSafe -Path $junctionPath -Confirm:$false
+
+        $result.Success | Should -BeTrue
+        Get-Item -LiteralPath $junctionPath -Force -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+        Test-Path -LiteralPath (Join-Path $targetPath 'keep.txt') | Should -BeTrue
+    }
+
+    It "refuses safe-link deletion for an ordinary file" {
+        $regularPath = Join-Path $TestDrive 'ordinary-file.txt'
+        Set-Content -LiteralPath $regularPath -Value 'keep ordinary data'
+
+        $result = Remove-PathForgeLinkSafe -Path $regularPath -Confirm:$false
+
+        $result.Success | Should -BeFalse
+        $result.Error | Should -Match 'not a reparse point or a file with multiple hard links'
+        Test-Path -LiteralPath $regularPath | Should -BeTrue
+    }
+
+    It "previews link-only removal without changing the link or target" {
+        $targetPath = Join-Path $TestDrive 'preview-junction-target'
+        $junctionPath = Join-Path $TestDrive 'preview-junction'
+        New-Item -ItemType Directory -Path $targetPath | Out-Null
+        New-Item -ItemType Junction -Path $junctionPath -Target $targetPath | Out-Null
+
+        $result = Remove-PathForgeLinkSafe -Path $junctionPath -WhatIf
+
+        $result.Success | Should -BeTrue
+        $result.Simulated | Should -BeTrue
+        Get-Item -LiteralPath $junctionPath -Force | Should -Not -BeNullOrEmpty
+        Test-Path -LiteralPath $targetPath | Should -BeTrue
     }
 }
 
@@ -639,6 +721,52 @@ Describe "Scheduled deletion queue editor" {
 
         $bootAst.Extent.Text | Should -Match 'Add-PathForgePendingFileDelete'
         $bootAst.Extent.Text | Should -Not -Match 'Set-ItemProperty'
+    }
+}
+
+Describe "Link inspector and reparse explorer" {
+    It "exposes both link tools from the File Operations page" {
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+
+        $fileOpsAst.Extent.Text | Should -Match 'Title "Link Inspector"'
+        $fileOpsAst.Extent.Text | Should -Match 'BtnText "Inspect Link"'
+        $fileOpsAst.Extent.Text | Should -Match 'Show-LinkInspector'
+        $fileOpsAst.Extent.Text | Should -Match 'Title "Reparse Explorer"'
+        $fileOpsAst.Extent.Text | Should -Match 'BtnText "Scan Links"'
+        $fileOpsAst.Extent.Text | Should -Match 'Show-ReparsePointExplorer'
+    }
+
+    It "renders native link metadata and link-only deletion safeguards" {
+        $inspectorAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-LinkInspector'
+        }, $true) | Select-Object -First 1
+        $explorerAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-ReparsePointExplorer'
+        }, $true) | Select-Object -First 1
+
+        $inspectorAst.Extent.Text | Should -Match 'Safe Delete Link'
+        $inspectorAst.Extent.Text | Should -Match 'Remove-PathForgeLinkSafe'
+        $inspectorAst.Extent.Text | Should -Match 'HardLinkNamesList'
+        $explorerAst.Extent.Text | Should -Match 'ReparseExplorerGrid'
+        $explorerAst.Extent.Text | Should -Match 'Find-PathForgeReparsePoint'
+        $explorerAst.Extent.Text | Should -Match 'Export CSV'
+    }
+
+    It "checks reparse safety before any recycle or generic deletion attempt" {
+        $forceDeleteAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Invoke-ForceDelete'
+        }, $true) | Select-Object -First 1
+        $functionText = $forceDeleteAst.Extent.Text
+
+        $functionText.IndexOf('if (Test-ReparsePoint') | Should -BeLessThan $functionText.IndexOf('Attempting Recycle Bin')
+        $functionText | Should -Match 'Refusing generic deletion of reparse point'
+        $functionText | Should -Match 'Link deletion cancelled; no fallback method was run'
     }
 }
 

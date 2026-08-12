@@ -15,6 +15,7 @@ All notable changes to PathForge will be documented in this file.
 - Non-mutating deletion dry-run plans with target counts, sample paths, and per-method API applicability
 - CSV and text deletion batches with per-row method selection, validation, dry-run, and single-confirmation execution
 - Scheduled deletion queue editor with pair-preserving selective cancellation, stale-snapshot protection, and modern queue-prefix display
+- Native junction, symbolic-link, hard-link, and reparse-point inspection with non-traversing tree scans, CSV export, and link-only safe deletion
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation
@@ -23,6 +24,7 @@ All notable changes to PathForge will be documented in this file.
 - Always remove the temporary empty directory after Robocopy failures
 - Stream DISM, SFC, and CHKDSK output through one testable core runner instead of duplicated GUI handlers
 - Package the GUI script and required core module together in the Scoop manifest
+- Prevent Recycle Bin or generic recursive deletion methods from running against reparse points
 
 ## [v3.1.0] - 2026-06-20
 

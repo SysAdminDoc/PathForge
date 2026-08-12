@@ -19,6 +19,7 @@ All notable changes to PathForge will be documented in this file.
 - Recoverable same-volume quarantine storage with atomic manifests, restore and manual purge controls, configurable retention, batch support, and startup auto-purge
 - Read-only native NTFS MFT size and fragmentation reporting with a physical-placement graph, extent table, partial-result handling, and CSV export
 - Bounded read-only USN Journal browsing with native reason filters, close-summary mode, CSV export, and optional Security 4663 process-evidence correlation
+- Side-by-side ACL comparison with normalized owner, inheritance, and ACE differences plus Authz-computed effective-permission export for a selected identity
 
 ### Fixed
 - Prompt before closing the application during an active repair and terminate the child process only after confirmation

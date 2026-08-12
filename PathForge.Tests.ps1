@@ -38,7 +38,8 @@ Describe "PathForge.Core module boundary" {
                 'Get-PathForgeQuarantineItem', 'Move-PathForgeToQuarantine',
                 'Restore-PathForgeQuarantineItem', 'Remove-PathForgeQuarantineItem',
                 'Invoke-PathForgeQuarantineMaintenance', 'Get-PathForgeUsnReasonCatalog',
-                'Get-PathForgeUsnJournal', 'Get-PathForgeMftReport')) {
+                'Get-PathForgeUsnJournal', 'Get-PathForgeMftReport',
+                'Get-PathForgeAclSnapshot', 'Compare-PathForgeAcl')) {
             (Get-Command $commandName).ModuleName | Should -Be 'PathForge.Core'
         }
     }
@@ -342,6 +343,61 @@ Describe "PathForge.Core module boundary" {
         $report.Supported | Should -BeFalse
         $report.Error | Should -Match 'only to NTFS'
         Should -Invoke Get-PathForgeNtfsVolumeDataNative -ModuleName PathForge.Core -Times 0
+    }
+
+    It "evaluates effective file access with the current logon token" {
+        $target = Join-Path $TestDrive 'effective-access.txt'
+        Set-Content -LiteralPath $target -Value 'permission evidence'
+
+        $snapshot = Get-PathForgeAclSnapshot -Path $target
+
+        $snapshot.Path | Should -Be (Get-Item -LiteralPath $target).FullName
+        $snapshot.AccessRuleCount | Should -BeGreaterThan 0
+        $snapshot.EffectiveAccess.Success | Should -BeTrue
+        $snapshot.EffectiveAccess.ContextMode | Should -Be 'Current logon token'
+        $snapshot.EffectiveAccess.GrantedAccessMask | Should -BeGreaterThan 0
+        $snapshot.EffectiveAccess.Capabilities.Count | Should -BeGreaterThan 10
+    }
+
+    It "reports identical structural and effective ACLs for the same path" {
+        $target = Join-Path $TestDrive 'same-acl.txt'
+        Set-Content -LiteralPath $target -Value 'same path comparison'
+
+        $comparison = Compare-PathForgeAcl -PathA $target -PathB $target
+
+        $comparison.Success | Should -BeTrue
+        $comparison.StructuralEquivalent | Should -BeTrue
+        $comparison.EffectiveAvailable | Should -BeTrue
+        $comparison.EffectiveEquivalent | Should -BeTrue
+        $comparison.DiffRows.Count | Should -Be 0
+        @($comparison.ExportRows | Where-Object Category -Like 'Effective*').Count | Should -BeGreaterThan 10
+    }
+
+    It "distinguishes metadata, ACE rights, and effective-right changes" {
+        $ruleA = [PSCustomObject]@{
+            Identity='CONTOSO\Analyst';Sid='S-1-5-21-1';AccessType='Allow';Rights='Read';RightsMask=[uint32]131209;RightsMaskHex='0x00020089';IsInherited=$false;InheritanceFlags='None';PropagationFlags='None';BaseKey='S-1-5-21-1|Allow|False|None|None';Signature='S-1-5-21-1|Allow|False|None|None|00020089'
+        }
+        $ruleB = [PSCustomObject]@{
+            Identity='CONTOSO\Analyst';Sid='S-1-5-21-1';AccessType='Allow';Rights='Modify';RightsMask=[uint32]197055;RightsMaskHex='0x000301BF';IsInherited=$false;InheritanceFlags='None';PropagationFlags='None';BaseKey='S-1-5-21-1|Allow|False|None|None';Signature='S-1-5-21-1|Allow|False|None|None|000301BF'
+        }
+        Mock Get-PathForgeAclSnapshot -ModuleName PathForge.Core {
+            if ($Path -eq 'A') {
+                [PSCustomObject]@{Path='A';IsDirectory=$false;Owner='CONTOSO\OwnerA';OwnerSid='S-1-5-21-10';AreAccessRulesProtected=$false;AreAccessRulesCanonical=$true;AccessRules=@($ruleA);EffectiveAccess=[PSCustomObject]@{Success=$true;Identity='CONTOSO\Analyst';GrantedAccessMask=[uint32]131209;ContextMode='SID with Authz group resolution';ContextCaveat='Estimated from SID.';Error=$null}}
+            }
+            else {
+                [PSCustomObject]@{Path='B';IsDirectory=$false;Owner='CONTOSO\OwnerB';OwnerSid='S-1-5-21-20';AreAccessRulesProtected=$true;AreAccessRulesCanonical=$true;AccessRules=@($ruleB);EffectiveAccess=[PSCustomObject]@{Success=$true;Identity='CONTOSO\Analyst';GrantedAccessMask=[uint32]197055;ContextMode='SID with Authz group resolution';ContextCaveat='Estimated from SID.';Error=$null}}
+            }
+        }
+
+        $comparison = Compare-PathForgeAcl -PathA 'A' -PathB 'B' -Identity 'CONTOSO\Analyst'
+
+        $comparison.StructuralEquivalent | Should -BeFalse
+        $comparison.EffectiveEquivalent | Should -BeFalse
+        $comparison.MetadataDifferenceCount | Should -Be 3
+        $comparison.AceDifferenceCount | Should -Be 1
+        $comparison.EffectiveDifferenceCount | Should -BeGreaterThan 0
+        $comparison.AceRows[0].Change | Should -Be 'Rights changed'
+        $comparison.EffectiveRows.Principal | Should -Contain 'Modify'
     }
 
     It "packages the GUI and core module together in the Scoop manifest" {
@@ -1223,6 +1279,39 @@ Describe "USN Journal browser GUI" {
         $coreSource | Should -Match 'READ_USN_JOURNAL'
         $coreSource | Should -Not -Match 'FSCTL_CREATE_USN_JOURNAL'
         $coreSource | Should -Not -Match 'FSCTL_DELETE_USN_JOURNAL'
+    }
+}
+
+Describe "ACL diff and effective access GUI" {
+    It "exposes the comparison workflow from File Operations" {
+        $fileOpsAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-FileOpsPage'
+        }, $true) | Select-Object -First 1
+        $dialogAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Show-AclDiffDialog'
+        }, $true) | Select-Object -First 1
+
+        $fileOpsAst.Extent.Text | Should -Match 'Title "ACL Diff"'
+        $fileOpsAst.Extent.Text | Should -Match 'Show-AclDiffDialog'
+        $dialogAst.Extent.Text | Should -Match 'AclDiffPathA'
+        $dialogAst.Extent.Text | Should -Match 'AclDiffPathB'
+        $dialogAst.Extent.Text | Should -Match 'AclDiffIdentity'
+        $dialogAst.Extent.Text | Should -Match 'AclDiffGrid'
+        $dialogAst.Extent.Text | Should -Match 'Compare-PathForgeAcl'
+        $dialogAst.Extent.Text | Should -Match 'actual logon token'
+        $dialogAst.Extent.Text | Should -Match 'Export CSV'
+    }
+
+    It "uses Authz access checks instead of adding ACE masks" {
+        $coreSource = Get-Content -Raw -LiteralPath $coreModulePath
+
+        $coreSource | Should -Match 'AuthzInitializeContextFromToken'
+        $coreSource | Should -Match 'AuthzInitializeContextFromSid'
+        $coreSource | Should -Match 'AuthzAccessCheck'
+        $coreSource | Should -Match 'MAXIMUM_ALLOWED'
+        $coreSource | Should -Not -Match 'GetEffectiveRightsFromAcl'
     }
 }
 

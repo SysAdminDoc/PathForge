@@ -23,6 +23,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 - **Quarantine Zone** — Move files and folders into recoverable same-volume storage, restore them, or purge them after a configurable retention period
 - **Take Ownership** — Seize control of protected system files with one click
 - **Permission Reset** — Restore inheritance and remove explicit deny entries
+- **ACL Diff** — Compare two paths and export normalized ACL changes plus Authz-computed effective permissions for an identity
 - **Orphaned SID Cleanup** — Identify and remove permissions for deleted accounts
 - **Alternate Data Streams** — Scan and remove hidden NTFS streams (Zone.Identifier, etc.)
 - **File Unblocking** — Remove "downloaded from internet" flags recursively
@@ -143,6 +144,12 @@ Use **Link Inspector** on a file or directory to distinguish ordinary objects, h
 
 Use **Reparse Explorer** on a directory to list reparse type, native tag, path, and target. Its iterative scan never enqueues a discovered reparse-point directory, so target trees are not traversed. Results can be inspected individually or exported to CSV.
 
+### ACL Diff and Effective Access
+
+Open **ACL Diff** from File Operations to compare two files or folders. The report separates owner and inheritance changes from normalized access-rule changes, evaluates each standard and detailed permission for one identity, and exports the complete comparison to CSV without modifying either ACL.
+
+For the signed-in account, PathForge evaluates the actual logon token and its enabled groups. For another account or SID, Windows Authz resolves that identity's groups; the dialog labels this mode because logon-only groups and runtime claims can differ from a real sign-in token.
+
 ### MFT Layout
 
 Open **MFT Layout** from Diagnostics to inspect the selected NTFS volume without modifying it. The report shows valid and allocated MFT size, estimated file-record count, cluster/record sizes, fragmentation boundaries, and every native extent. The graph plots logical MFT order against physical cluster placement and marks the reserved MFT zone; the extent table can be exported to CSV.
@@ -229,6 +236,7 @@ PathForge includes detailed explanations accessible via **ℹ️ Show Details** 
 - **FSCTL_GET_NTFS_VOLUME_DATA** — Read NTFS volume geometry, MFT size, record size, and reserved zone
 - **FSCTL_GET_RETRIEVAL_POINTERS** — Enumerate the physical extents backing the MFT without changing the volume
 - **FSCTL_QUERY_USN_JOURNAL / FSCTL_READ_USN_JOURNAL** — Query journal metadata and selectively read change records by reason flags
+- **AuthzAccessCheck** — Compute maximum effective file access from the current token or a requested SID and its resolved groups
 - **FSCTL_GET_REPARSE_POINT** — Native reparse tag and target inspection without following the link
 - **FindFirstFileNameW / FindNextFileNameW** — Enumerate every hard-link name
 - **DeleteFileW / RemoveDirectoryW** — Remove only a recognized link or hard-link name without recursive traversal

@@ -1504,6 +1504,358 @@ function Export-ACLReport {
     }
 }
 
+function Show-AclDiffDialog {
+    $dialog = New-Object System.Windows.Forms.Form
+    $dialog.Text = "ACL Diff and Effective Access"
+    $dialog.Size = New-Object System.Drawing.Size(1180, 790)
+    $dialog.MinimumSize = New-Object System.Drawing.Size(1040, 700)
+    $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.BackColor = $Script:Theme.BgPrimary
+    $dialog.ForeColor = $Script:Theme.TextPrimary
+    $dialog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dialog.Add_HandleCreated({ try { [DarkMode]::EnableDarkTitleBar($this.Handle) } catch { Write-Verbose "ACL diff title-bar theming failed: $_" } })
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "ACL Diff and Effective Access"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $Script:Theme.TextPrimary
+    $title.Location = New-Object System.Drawing.Point(20, 14)
+    $title.AutoSize = $true
+    $null = $dialog.Controls.Add($title)
+
+    $description = New-Object System.Windows.Forms.Label
+    $description.Text = "Compare owners, inheritance, and normalized access rules; then evaluate what one identity can actually do."
+    $description.ForeColor = $Script:Theme.TextMuted
+    $description.Location = New-Object System.Drawing.Point(22, 46)
+    $description.Size = New-Object System.Drawing.Size(920, 22)
+    $null = $dialog.Controls.Add($description)
+
+    $newInputLabel = {
+        param([string]$Text, [int]$Y)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 8)
+        $label.ForeColor = $Script:Theme.TextMuted
+        $label.Location = New-Object System.Drawing.Point(22, $Y)
+        $label.Size = New-Object System.Drawing.Size(92, 25)
+        $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $null = $dialog.Controls.Add($label)
+    }
+    & $newInputLabel "PATH A" 78
+    & $newInputLabel "PATH B" 113
+    & $newInputLabel "IDENTITY" 148
+
+    $newPathBox = {
+        param([string]$Name, [int]$Y)
+        $box = New-Object System.Windows.Forms.TextBox
+        $box.Name = $Name
+        $box.AccessibleName = $Name
+        $box.Location = New-Object System.Drawing.Point(115, $Y)
+        $box.Size = New-Object System.Drawing.Size(810, 25)
+        $box.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+        $box.BackColor = $Script:Theme.BgInput
+        $box.ForeColor = $Script:Theme.TextPrimary
+        $box.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        $null = $dialog.Controls.Add($box)
+        return $box
+    }
+    $pathABox = & $newPathBox "AclDiffPathA" 78
+    $pathBBox = & $newPathBox "AclDiffPathB" 113
+    if ($Script:PathTextBox -and -not [string]::IsNullOrWhiteSpace([string]$Script:PathTextBox.Text)) {
+        $pathABox.Text = [string]$Script:PathTextBox.Text
+    }
+
+    $identityBox = & $newPathBox "AclDiffIdentity" 148
+    try { $identityBox.Text = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name }
+    catch { $identityBox.Text = '' }
+
+    $newBrowseButton = {
+        param([string]$Name, [int]$Y)
+        $button = New-Object System.Windows.Forms.Button
+        $button.Name = $Name
+        $button.Text = "Folder..."
+        $button.AccessibleName = "Choose a folder"
+        $button.Location = New-Object System.Drawing.Point(935, ($Y - 2))
+        $button.Size = New-Object System.Drawing.Size(92, 29)
+        $button.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+        $button.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $button.BackColor = $Script:Theme.BgTertiary
+        $button.ForeColor = $Script:Theme.TextSecondary
+        $button.FlatAppearance.BorderColor = $Script:Theme.Border
+        $null = $dialog.Controls.Add($button)
+        return $button
+    }
+    $browseA = & $newBrowseButton "AclDiffBrowseA" 78
+    $browseB = & $newBrowseButton "AclDiffBrowseB" 113
+
+    $swapButton = New-Object System.Windows.Forms.Button
+    $swapButton.Text = "Swap"
+    $swapButton.AccessibleName = "Swap ACL comparison paths"
+    $swapButton.Location = New-Object System.Drawing.Point(1037, 76)
+    $swapButton.Size = New-Object System.Drawing.Size(100, 29)
+    $swapButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $swapButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $swapButton.BackColor = $Script:Theme.BgTertiary
+    $swapButton.ForeColor = $Script:Theme.TextSecondary
+    $swapButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $null = $dialog.Controls.Add($swapButton)
+
+    $compareButton = New-Object System.Windows.Forms.Button
+    $compareButton.Text = "Compare"
+    $compareButton.AccessibleName = "Compare ACLs and effective access"
+    $compareButton.Location = New-Object System.Drawing.Point(935, 146)
+    $compareButton.Size = New-Object System.Drawing.Size(92, 31)
+    $compareButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $compareButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $compareButton.BackColor = $Script:Theme.Accent
+    $compareButton.ForeColor = $Script:Theme.TextPrimary
+    $compareButton.FlatAppearance.BorderSize = 0
+    $null = $dialog.Controls.Add($compareButton)
+
+    $exportButton = New-Object System.Windows.Forms.Button
+    $exportButton.Text = "Export CSV"
+    $exportButton.AccessibleName = "Export ACL and effective permission comparison"
+    $exportButton.Location = New-Object System.Drawing.Point(1037, 146)
+    $exportButton.Size = New-Object System.Drawing.Size(100, 31)
+    $exportButton.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Right
+    $exportButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $exportButton.BackColor = $Script:Theme.BgTertiary
+    $exportButton.ForeColor = $Script:Theme.TextSecondary
+    $exportButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $exportButton.Enabled = $false
+    $null = $dialog.Controls.Add($exportButton)
+
+    $contextLabel = New-Object System.Windows.Forms.Label
+    $contextLabel.Name = "AclDiffContextNote"
+    $contextLabel.Text = "Current account uses the actual logon token; other accounts use Authz SID/group resolution. File paths may be typed or pasted."
+    $contextLabel.ForeColor = $Script:Theme.Info
+    $contextLabel.Location = New-Object System.Drawing.Point(115, 181)
+    $contextLabel.Size = New-Object System.Drawing.Size(1022, 30)
+    $contextLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $null = $dialog.Controls.Add($contextLabel)
+
+    $summaryPanel = New-Object System.Windows.Forms.Panel
+    $summaryPanel.Name = "AclDiffSummaryPanel"
+    $summaryPanel.Location = New-Object System.Drawing.Point(20, 214)
+    $summaryPanel.Size = New-Object System.Drawing.Size(1118, 78)
+    $summaryPanel.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $summaryPanel.BackColor = $Script:Theme.BgCard
+    $null = $dialog.Controls.Add($summaryPanel)
+
+    $summaryValues = @{}
+    foreach ($definition in @(
+            @{Key='Structure';Title='STRUCTURAL ACL';X=18;Width=245},
+            @{Key='Entries';Title='ACE DIFFERENCES';X=280;Width=200},
+            @{Key='Effective';Title='EFFECTIVE ACCESS';X=500;Width=385},
+            @{Key='Identity';Title='EVALUATED IDENTITY';X=900;Width=200})) {
+        $heading = New-Object System.Windows.Forms.Label
+        $heading.Text = $definition.Title
+        $heading.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 7.5)
+        $heading.ForeColor = $Script:Theme.TextMuted
+        $heading.Location = New-Object System.Drawing.Point($definition.X, 10)
+        $heading.Size = New-Object System.Drawing.Size($definition.Width, 18)
+        $null = $summaryPanel.Controls.Add($heading)
+
+        $value = New-Object System.Windows.Forms.Label
+        $value.Name = "AclDiffSummary$($definition.Key)"
+        $value.Text = "-"
+        $value.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 10.5)
+        $value.ForeColor = $Script:Theme.Info
+        $value.Location = New-Object System.Drawing.Point($definition.X, 32)
+        $value.Size = New-Object System.Drawing.Size($definition.Width, 34)
+        $value.AutoEllipsis = $true
+        $null = $summaryPanel.Controls.Add($value)
+        $summaryValues[$definition.Key] = $value
+    }
+
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Name = "AclDiffGrid"
+    $grid.AccessibleName = "ACL and effective permission differences"
+    $grid.Location = New-Object System.Drawing.Point(20, 304)
+    $grid.Size = New-Object System.Drawing.Size(1118, 370)
+    $grid.Anchor = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $grid.BackgroundColor = $Script:Theme.BgInput
+    $grid.ForeColor = $Script:Theme.TextPrimary
+    $grid.GridColor = $Script:Theme.Border
+    $grid.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $grid.ColumnHeadersDefaultCellStyle.BackColor = $Script:Theme.BgTertiary
+    $grid.ColumnHeadersDefaultCellStyle.ForeColor = $Script:Theme.TextPrimary
+    $grid.DefaultCellStyle.BackColor = $Script:Theme.BgInput
+    $grid.DefaultCellStyle.ForeColor = $Script:Theme.TextSecondary
+    $grid.DefaultCellStyle.SelectionBackColor = $Script:Theme.AccentDim
+    $grid.DefaultCellStyle.SelectionForeColor = $Script:Theme.TextPrimary
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ReadOnly = $true
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.AutoGenerateColumns = $false
+    $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+    $grid.RowHeadersVisible = $false
+    foreach ($definition in @(
+            @{Name='Category';Header='Category';Width=125},
+            @{Name='Change';Header='Change';Width=110},
+            @{Name='Principal';Header='Principal / right';Width=210},
+            @{Name='AccessType';Header='Type';Width=90},
+            @{Name='PathA';Header='Path A';Width=190},
+            @{Name='PathB';Header='Path B';Width=190},
+            @{Name='Details';Header='Details';Width=190;Fill=$true})) {
+        $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $column.Name = $definition.Name
+        $column.HeaderText = $definition.Header
+        $column.Width = $definition.Width
+        if ($definition.Fill) { $column.AutoSizeMode = [System.Windows.Forms.DataGridViewAutoSizeColumnMode]::Fill }
+        $null = $grid.Columns.Add($column)
+    }
+    $null = $dialog.Controls.Add($grid)
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Name = "AclDiffStatus"
+    $statusLabel.Text = "Enter two existing paths, then compare. This tool is read-only."
+    $statusLabel.ForeColor = $Script:Theme.TextMuted
+    $statusLabel.Location = New-Object System.Drawing.Point(22, 690)
+    $statusLabel.Size = New-Object System.Drawing.Size(930, 38)
+    $statusLabel.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $null = $dialog.Controls.Add($statusLabel)
+
+    $closeButton = New-Object System.Windows.Forms.Button
+    $closeButton.Text = "Close"
+    $closeButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $closeButton.Location = New-Object System.Drawing.Point(1038, 690)
+    $closeButton.Size = New-Object System.Drawing.Size(100, 32)
+    $closeButton.Anchor = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Right
+    $closeButton.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $closeButton.BackColor = $Script:Theme.BgTertiary
+    $closeButton.ForeColor = $Script:Theme.TextSecondary
+    $closeButton.FlatAppearance.BorderColor = $Script:Theme.Border
+    $null = $dialog.Controls.Add($closeButton)
+    $dialog.CancelButton = $closeButton
+
+    $selectFolder = {
+        param($TargetBox)
+        $folderDialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $folderDialog.Description = "Choose a folder to compare. File paths can be typed or pasted into the field."
+        $folderDialog.ShowNewFolderButton = $false
+        try {
+            if (Test-Path -LiteralPath $TargetBox.Text -PathType Container) { $folderDialog.SelectedPath = $TargetBox.Text }
+            elseif (Test-Path -LiteralPath $TargetBox.Text -PathType Leaf) { $folderDialog.SelectedPath = Split-Path -Parent $TargetBox.Text }
+            if ($folderDialog.ShowDialog($dialog) -eq [System.Windows.Forms.DialogResult]::OK) { $TargetBox.Text = $folderDialog.SelectedPath }
+        }
+        finally { $folderDialog.Dispose() }
+    }.GetNewClosure()
+    $browseA.Add_Click({ & $selectFolder $pathABox }.GetNewClosure())
+    $browseB.Add_Click({ & $selectFolder $pathBBox }.GetNewClosure())
+    $swapButton.Add_Click({
+        $path = $pathABox.Text
+        $pathABox.Text = $pathBBox.Text
+        $pathBBox.Text = $path
+    }.GetNewClosure())
+
+    $compareState = [PSCustomObject]@{Running=$false}
+    $runComparison = {
+        if ($compareState.Running) { return }
+        if ([string]::IsNullOrWhiteSpace($pathABox.Text) -or [string]::IsNullOrWhiteSpace($pathBBox.Text)) {
+            $statusLabel.Text = "Both Path A and Path B are required."
+            $statusLabel.ForeColor = $Script:Theme.Error
+            return
+        }
+        foreach ($pathValue in @($pathABox.Text, $pathBBox.Text)) {
+            if (-not (Test-Path -LiteralPath $pathValue)) {
+                $statusLabel.Text = "Path not found: $pathValue"
+                $statusLabel.ForeColor = $Script:Theme.Error
+                return
+            }
+        }
+
+        $compareState.Running = $true
+        $compareButton.Enabled = $false
+        $exportButton.Enabled = $false
+        $statusLabel.Text = "Reading security descriptors and evaluating effective access..."
+        $statusLabel.ForeColor = $Script:Theme.Info
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            if ($grid.Rows.Count -gt 0) { $grid.Rows.Clear() }
+            $report = Compare-PathForgeAcl -PathA $pathABox.Text -PathB $pathBBox.Text -Identity $identityBox.Text
+            $dialog.Tag = $report
+            foreach ($row in @($report.DiffRows)) {
+                $rowIndex = $grid.Rows.Add($row.Category, $row.Change, $row.Principal, $row.AccessType, $row.PathA, $row.PathB, $row.Details)
+                $grid.Rows[$rowIndex].DefaultCellStyle.ForeColor = if ($row.Category -like 'Effective*') { $Script:Theme.Info } else { $Script:Theme.Warning }
+            }
+            if ($report.DiffRows.Count -eq 0) {
+                $rowIndex = $grid.Rows.Add('Result', 'Same', '', '', 'No differences', 'No differences', 'The normalized ACL and effective-access mask match.')
+                $grid.Rows[$rowIndex].DefaultCellStyle.ForeColor = $Script:Theme.Success
+            }
+
+            $summaryValues.Structure.Text = if ($report.StructuralEquivalent) { 'Match' } else { 'Differences found' }
+            $summaryValues.Structure.ForeColor = if ($report.StructuralEquivalent) { $Script:Theme.Success } else { $Script:Theme.Warning }
+            $summaryValues.Entries.Text = "$($report.AceDifferenceCount) ACE / $($report.MetadataDifferenceCount) metadata"
+            if ($report.EffectiveAvailable) {
+                $summaryValues.Effective.Text = "$($report.PathA.EffectiveAccess.Summary)  ->  $($report.PathB.EffectiveAccess.Summary)"
+                $summaryValues.Effective.ForeColor = if ($report.EffectiveEquivalent) { $Script:Theme.Success } else { $Script:Theme.Warning }
+                $contextLabel.Text = "$($report.EffectiveContextMode): $($report.EffectiveContextCaveat)"
+            }
+            else {
+                $summaryValues.Effective.Text = 'Unavailable'
+                $summaryValues.Effective.ForeColor = $Script:Theme.Error
+                $contextLabel.Text = @($report.Errors) -join ' '
+            }
+            $summaryValues.Identity.Text = if ([string]::IsNullOrWhiteSpace($report.Identity)) { '(unresolved)' } else { $report.Identity }
+            $summaryValues.Identity.ForeColor = $Script:Theme.Info
+            $differenceCount = $report.MetadataDifferenceCount + $report.AceDifferenceCount + $report.EffectiveDifferenceCount
+            $statusLabel.Text = if ($report.Errors.Count -gt 0) {
+                "Compared with $differenceCount visible difference(s); effective access was incomplete."
+            }
+            else {
+                "Comparison complete: $differenceCount visible difference(s). No permissions were changed."
+            }
+            $statusLabel.ForeColor = if ($report.Errors.Count -gt 0) { $Script:Theme.Warning } elseif ($differenceCount -eq 0) { $Script:Theme.Success } else { $Script:Theme.Info }
+            $exportButton.Enabled = $report.ExportRows.Count -gt 0
+            Write-Console "ACL comparison complete: $($report.PathA.Path) vs $($report.PathB.Path) ($differenceCount differences)" -Type "Info"
+            Write-Log "ACL comparison: pathA=$($report.PathA.Path) pathB=$($report.PathB.Path) identity=$($report.Identity) differences=$differenceCount" -Level "INFO"
+        }
+        catch {
+            $dialog.Tag = $null
+            $statusLabel.Text = $_.Exception.Message
+            $statusLabel.ForeColor = $Script:Theme.Error
+            foreach ($value in $summaryValues.Values) { $value.Text = '-' }
+            Write-Console "ACL comparison failed: $($_.Exception.Message)" -Type "Error"
+            Write-Log "ACL comparison failed: $($_.Exception.Message)" -Level "ERROR"
+        }
+        finally {
+            $compareState.Running = $false
+            $compareButton.Enabled = $true
+        }
+    }.GetNewClosure()
+    $compareButton.Add_Click({ & $runComparison }.GetNewClosure())
+
+    $exportButton.Add_Click({
+        $report = $dialog.Tag
+        if (-not $report -or $report.ExportRows.Count -eq 0) { return }
+        $saveDialog = New-Object System.Windows.Forms.SaveFileDialog
+        $saveDialog.Title = "Export ACL and effective permission comparison"
+        $saveDialog.Filter = "CSV files (*.csv)|*.csv|All files (*.*)|*.*"
+        $saveDialog.FileName = "ACL_Diff_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+        if (Test-Path -LiteralPath $Script:Config.LogPath -PathType Container) { $saveDialog.InitialDirectory = $Script:Config.LogPath }
+        try {
+            if ($saveDialog.ShowDialog($dialog) -ne [System.Windows.Forms.DialogResult]::OK) { return }
+            $report.ExportRows | Select-Object @{Name='SourcePathA';Expression={$report.PathA.Path}}, @{Name='SourcePathB';Expression={$report.PathB.Path}}, @{Name='EvaluatedIdentity';Expression={$report.Identity}}, Category, Change, Principal, AccessType, PathA, PathB, Details |
+                Export-Csv -LiteralPath $saveDialog.FileName -NoTypeInformation -Encoding UTF8
+            $statusLabel.Text = "Comparison exported: $($saveDialog.FileName)"
+            $statusLabel.ForeColor = $Script:Theme.Success
+            Write-Console "ACL comparison exported: $($saveDialog.FileName)" -Type "Success"
+            Write-Log "ACL comparison exported: $($saveDialog.FileName)" -Level "SUCCESS"
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, "Export Failed", 0, 16) | Out-Null
+        }
+        finally { $saveDialog.Dispose() }
+    }.GetNewClosure())
+
+    $owner = [System.Windows.Forms.Form]::ActiveForm
+    if ($owner -and $owner -ne $dialog) { [void]$dialog.ShowDialog($owner) } else { [void]$dialog.ShowDialog() }
+    $dialog.Dispose()
+}
+
 # ============================================================================
 # BOOT-TIME DELETION
 # ============================================================================
@@ -4864,6 +5216,11 @@ function Build-FileOpsPage {
         Export-ACLReport -Path $Script:PathTextBox.Text
     }
     $null = $page.Controls.Add($card7b)
+
+    $card7c = New-ToolCard -Title "ACL Diff" -Desc "Compare two ACLs and export Authz-computed effective permissions for an identity" -BtnText "Compare Paths" -X 610 -Y $y -OnClick {
+        Show-AclDiffDialog
+    }
+    $null = $page.Controls.Add($card7c)
     $y += 130
 
     # Section: Alternate Data Streams

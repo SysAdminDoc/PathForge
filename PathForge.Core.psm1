@@ -929,6 +929,247 @@ public static class PathForgeNtfsNative {
 "@
 }
 
+if (-not ('PathForgeAuthzNative' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+
+public sealed class PathForgeEffectiveAccessData {
+    public string IdentityName { get; set; }
+    public string Sid { get; set; }
+    public uint GrantedAccessMask { get; set; }
+    public int EvaluationError { get; set; }
+    public string ContextMode { get; set; }
+}
+
+public static class PathForgeAuthzNative {
+    private const uint AUTHZ_RM_FLAG_NO_AUDIT = 0x00000001;
+    private const uint AUTHZ_COMPUTE_PRIVILEGES = 0x00000008;
+    private const uint MAXIMUM_ALLOWED = 0x02000000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Luid {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AuthzAccessRequest {
+        public uint DesiredAccess;
+        public IntPtr PrincipalSelfSid;
+        public IntPtr ObjectTypeList;
+        public uint ObjectTypeListLength;
+        public IntPtr OptionalArguments;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AuthzAccessReply {
+        public uint ResultListLength;
+        public IntPtr GrantedAccessMask;
+        public IntPtr SaclEvaluationResults;
+        public IntPtr Error;
+    }
+
+    [DllImport("authz.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool AuthzInitializeResourceManager(
+        uint flags,
+        IntPtr accessCheck,
+        IntPtr computeDynamicGroups,
+        IntPtr freeDynamicGroups,
+        string resourceManagerName,
+        out IntPtr resourceManager);
+
+    [DllImport("authz.dll", SetLastError = true)]
+    private static extern bool AuthzInitializeContextFromToken(
+        uint flags,
+        IntPtr tokenHandle,
+        IntPtr resourceManager,
+        IntPtr expirationTime,
+        Luid identifier,
+        IntPtr dynamicGroupArgs,
+        out IntPtr clientContext);
+
+    [DllImport("authz.dll", SetLastError = true)]
+    private static extern bool AuthzInitializeContextFromSid(
+        uint flags,
+        IntPtr userSid,
+        IntPtr resourceManager,
+        IntPtr expirationTime,
+        Luid identifier,
+        IntPtr dynamicGroupArgs,
+        out IntPtr clientContext);
+
+    [DllImport("authz.dll", SetLastError = true)]
+    private static extern bool AuthzAccessCheck(
+        uint flags,
+        IntPtr clientContext,
+        ref AuthzAccessRequest request,
+        IntPtr auditEvent,
+        IntPtr securityDescriptor,
+        IntPtr optionalSecurityDescriptorArray,
+        uint optionalSecurityDescriptorCount,
+        ref AuthzAccessReply reply,
+        IntPtr accessCheckResults);
+
+    [DllImport("authz.dll")]
+    private static extern bool AuthzFreeContext(IntPtr clientContext);
+
+    [DllImport("authz.dll")]
+    private static extern bool AuthzFreeResourceManager(IntPtr resourceManager);
+
+    private static SecurityIdentifier ResolveSid(string identity) {
+        try {
+            return new SecurityIdentifier(identity);
+        }
+        catch (ArgumentException) {
+            return (SecurityIdentifier)new NTAccount(identity).Translate(typeof(SecurityIdentifier));
+        }
+    }
+
+    private static string ResolveName(SecurityIdentifier sid) {
+        try {
+            return ((NTAccount)sid.Translate(typeof(NTAccount))).Value;
+        }
+        catch (IdentityNotMappedException) {
+            return sid.Value;
+        }
+    }
+
+    private static Win32Exception NativeError(string operation) {
+        int error = Marshal.GetLastWin32Error();
+        return new Win32Exception(error, operation + " failed: " + new Win32Exception(error).Message);
+    }
+
+    public static PathForgeEffectiveAccessData GetEffectiveAccess(byte[] securityDescriptor, string identity) {
+        if (securityDescriptor == null || securityDescriptor.Length == 0) {
+            throw new ArgumentException("A binary security descriptor is required.", "securityDescriptor");
+        }
+
+        IntPtr resourceManager = IntPtr.Zero;
+        IntPtr clientContext = IntPtr.Zero;
+        IntPtr sidMemory = IntPtr.Zero;
+        IntPtr descriptorMemory = IntPtr.Zero;
+        IntPtr grantedMemory = IntPtr.Zero;
+        IntPtr saclMemory = IntPtr.Zero;
+        IntPtr errorMemory = IntPtr.Zero;
+        WindowsIdentity currentIdentity = null;
+        try {
+            if (!AuthzInitializeResourceManager(
+                    AUTHZ_RM_FLAG_NO_AUDIT,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    "PathForge ACL Diff",
+                    out resourceManager)) {
+                throw NativeError("AuthzInitializeResourceManager");
+            }
+
+            currentIdentity = WindowsIdentity.GetCurrent(TokenAccessLevels.Query);
+            SecurityIdentifier requestedSid;
+            bool useCurrentToken = String.IsNullOrWhiteSpace(identity);
+            if (useCurrentToken) {
+                requestedSid = currentIdentity.User;
+            }
+            else {
+                requestedSid = ResolveSid(identity.Trim());
+                useCurrentToken = requestedSid.Equals(currentIdentity.User);
+            }
+
+            Luid identifier = new Luid();
+            string contextMode;
+            if (useCurrentToken) {
+                if (!AuthzInitializeContextFromToken(
+                        0,
+                        currentIdentity.Token,
+                        resourceManager,
+                        IntPtr.Zero,
+                        identifier,
+                        IntPtr.Zero,
+                        out clientContext)) {
+                    throw NativeError("AuthzInitializeContextFromToken");
+                }
+                contextMode = "Current logon token";
+            }
+            else {
+                byte[] sidBytes = new byte[requestedSid.BinaryLength];
+                requestedSid.GetBinaryForm(sidBytes, 0);
+                sidMemory = Marshal.AllocHGlobal(sidBytes.Length);
+                Marshal.Copy(sidBytes, 0, sidMemory, sidBytes.Length);
+                if (!AuthzInitializeContextFromSid(
+                        AUTHZ_COMPUTE_PRIVILEGES,
+                        sidMemory,
+                        resourceManager,
+                        IntPtr.Zero,
+                        identifier,
+                        IntPtr.Zero,
+                        out clientContext)) {
+                    throw NativeError("AuthzInitializeContextFromSid");
+                }
+                contextMode = "SID with Authz group resolution";
+            }
+
+            descriptorMemory = Marshal.AllocHGlobal(securityDescriptor.Length);
+            Marshal.Copy(securityDescriptor, 0, descriptorMemory, securityDescriptor.Length);
+            grantedMemory = Marshal.AllocHGlobal(sizeof(uint));
+            saclMemory = Marshal.AllocHGlobal(sizeof(uint));
+            errorMemory = Marshal.AllocHGlobal(sizeof(uint));
+            Marshal.WriteInt32(grantedMemory, 0);
+            Marshal.WriteInt32(saclMemory, 0);
+            Marshal.WriteInt32(errorMemory, 0);
+
+            AuthzAccessRequest request = new AuthzAccessRequest {
+                DesiredAccess = MAXIMUM_ALLOWED,
+                PrincipalSelfSid = IntPtr.Zero,
+                ObjectTypeList = IntPtr.Zero,
+                ObjectTypeListLength = 0,
+                OptionalArguments = IntPtr.Zero
+            };
+            AuthzAccessReply reply = new AuthzAccessReply {
+                ResultListLength = 1,
+                GrantedAccessMask = grantedMemory,
+                SaclEvaluationResults = saclMemory,
+                Error = errorMemory
+            };
+            if (!AuthzAccessCheck(
+                    0,
+                    clientContext,
+                    ref request,
+                    IntPtr.Zero,
+                    descriptorMemory,
+                    IntPtr.Zero,
+                    0,
+                    ref reply,
+                    IntPtr.Zero)) {
+                throw NativeError("AuthzAccessCheck");
+            }
+
+            uint grantedMask = unchecked((uint)Marshal.ReadInt32(grantedMemory));
+            int evaluationError = Marshal.ReadInt32(errorMemory);
+            return new PathForgeEffectiveAccessData {
+                IdentityName = useCurrentToken ? currentIdentity.Name : ResolveName(requestedSid),
+                Sid = requestedSid.Value,
+                GrantedAccessMask = grantedMask,
+                EvaluationError = evaluationError,
+                ContextMode = contextMode
+            };
+        }
+        finally {
+            if (errorMemory != IntPtr.Zero) { Marshal.FreeHGlobal(errorMemory); }
+            if (saclMemory != IntPtr.Zero) { Marshal.FreeHGlobal(saclMemory); }
+            if (grantedMemory != IntPtr.Zero) { Marshal.FreeHGlobal(grantedMemory); }
+            if (descriptorMemory != IntPtr.Zero) { Marshal.FreeHGlobal(descriptorMemory); }
+            if (sidMemory != IntPtr.Zero) { Marshal.FreeHGlobal(sidMemory); }
+            if (clientContext != IntPtr.Zero) { AuthzFreeContext(clientContext); }
+            if (resourceManager != IntPtr.Zero) { AuthzFreeResourceManager(resourceManager); }
+            if (currentIdentity != null) { currentIdentity.Dispose(); }
+        }
+    }
+}
+"@
+}
+
 function Test-SafePath {
     [CmdletBinding()]
     param([string]$Path)
@@ -2785,6 +3026,363 @@ function Invoke-PathForgeDeletionMethod {
     return [PSCustomObject]@{Success = $false; Simulated = $false; Path = $Path; Method = 'Auto'; EffectiveMethod = $null; Attempts = $attempts.ToArray(); Error = 'All applicable immediate methods failed' }
 }
 
+function Get-PathForgeAclObject {
+    param([Parameter(Mandatory)][string]$Path)
+    return Get-Acl -LiteralPath $Path -ErrorAction Stop
+}
+
+function Get-PathForgeEffectiveAccessNative {
+    param(
+        [Parameter(Mandatory)][byte[]]$SecurityDescriptor,
+        [string]$Identity
+    )
+
+    return [PathForgeAuthzNative]::GetEffectiveAccess($SecurityDescriptor, $Identity)
+}
+
+function Get-PathForgeEffectiveRightCatalog {
+    param()
+
+    return @(
+        [PSCustomObject]@{Name = 'Full control'; Mask = [uint32]2032127; Kind = 'Standard' },
+        [PSCustomObject]@{Name = 'Modify'; Mask = [uint32]197055; Kind = 'Standard' },
+        [PSCustomObject]@{Name = 'Read and execute'; Mask = [uint32]131241; Kind = 'Standard' },
+        [PSCustomObject]@{Name = 'Read'; Mask = [uint32]131209; Kind = 'Standard' },
+        [PSCustomObject]@{Name = 'Write'; Mask = [uint32]278; Kind = 'Standard' },
+        [PSCustomObject]@{Name = 'Read data / list folder'; Mask = [uint32]1; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Write data / create files'; Mask = [uint32]2; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Append data / create folders'; Mask = [uint32]4; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Read extended attributes'; Mask = [uint32]8; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Write extended attributes'; Mask = [uint32]16; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Execute / traverse'; Mask = [uint32]32; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Delete children'; Mask = [uint32]64; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Read attributes'; Mask = [uint32]128; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Write attributes'; Mask = [uint32]256; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Delete'; Mask = [uint32]65536; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Read permissions'; Mask = [uint32]131072; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Change permissions'; Mask = [uint32]262144; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Take ownership'; Mask = [uint32]524288; Kind = 'Detailed' },
+        [PSCustomObject]@{Name = 'Synchronize'; Mask = [uint32]1048576; Kind = 'Detailed' }
+    )
+}
+
+function Resolve-PathForgeIdentity {
+    param([Parameter(Mandatory)][System.Security.Principal.IdentityReference]$IdentityReference)
+
+    $sid = $null
+    $name = [string]$IdentityReference.Value
+    try {
+        if ($IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+            $sid = [string]$IdentityReference.Value
+            try {
+                $name = [string]$IdentityReference.Translate([System.Security.Principal.NTAccount]).Value
+            }
+            catch [System.Security.Principal.IdentityNotMappedException] {
+                $name = $sid
+            }
+        }
+        else {
+            $sid = [string]$IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+    }
+    catch [System.Security.Principal.IdentityNotMappedException] {
+        if ($name -match '^S-\d-') { $sid = $name }
+    }
+
+    return [PSCustomObject]@{Name = $name; Sid = $sid }
+}
+
+function ConvertTo-PathForgeAclRule {
+    param([Parameter(Mandatory)][System.Security.AccessControl.FileSystemAccessRule]$Rule)
+
+    $identity = Resolve-PathForgeIdentity -IdentityReference $Rule.IdentityReference
+    $rightsMask = [uint32]([int64][int32]$Rule.FileSystemRights -band [int64]0xFFFFFFFF)
+    $accessType = [string]$Rule.AccessControlType
+    $inheritanceFlags = [string]$Rule.InheritanceFlags
+    $propagationFlags = [string]$Rule.PropagationFlags
+    $principalKey = if ([string]::IsNullOrWhiteSpace([string]$identity.Sid)) { [string]$identity.Name } else { [string]$identity.Sid }
+    $baseKey = '{0}|{1}|{2}|{3}|{4}' -f $principalKey, $accessType, [bool]$Rule.IsInherited, $inheritanceFlags, $propagationFlags
+
+    return [PSCustomObject]@{
+        Identity         = [string]$identity.Name
+        Sid              = [string]$identity.Sid
+        AccessType       = $accessType
+        Rights           = [string]$Rule.FileSystemRights
+        RightsMask       = $rightsMask
+        RightsMaskHex    = ('0x{0:X8}' -f $rightsMask)
+        IsInherited      = [bool]$Rule.IsInherited
+        InheritanceFlags = $inheritanceFlags
+        PropagationFlags = $propagationFlags
+        BaseKey          = $baseKey
+        Signature        = '{0}|{1:X8}' -f $baseKey, $rightsMask
+    }
+}
+
+function ConvertTo-PathForgeEffectiveAccess {
+    param(
+        [Parameter(Mandatory)]$NativeResult,
+        [string]$RequestedIdentity
+    )
+
+    $mask = [uint32]$NativeResult.GrantedAccessMask
+    $evaluationError = [int]$NativeResult.EvaluationError
+    if ($evaluationError -ne 0) {
+        $message = [System.ComponentModel.Win32Exception]::new($evaluationError).Message
+        return [PSCustomObject]@{
+            Success             = $false
+            RequestedIdentity   = $RequestedIdentity
+            Identity            = [string]$NativeResult.IdentityName
+            Sid                 = [string]$NativeResult.Sid
+            GrantedAccessMask   = $mask
+            GrantedAccessHex    = ('0x{0:X8}' -f $mask)
+            Summary             = 'Evaluation failed'
+            ContextMode         = [string]$NativeResult.ContextMode
+            ContextCaveat       = $null
+            Capabilities        = @()
+            Error               = "Authz access evaluation failed: $message (error $evaluationError)."
+        }
+    }
+
+    $capabilities = foreach ($definition in Get-PathForgeEffectiveRightCatalog) {
+        [PSCustomObject]@{
+            Name    = [string]$definition.Name
+            Kind    = [string]$definition.Kind
+            Mask    = [uint32]$definition.Mask
+            MaskHex = ('0x{0:X8}' -f [uint32]$definition.Mask)
+            Granted = ($mask -band [uint32]$definition.Mask) -eq [uint32]$definition.Mask
+        }
+    }
+
+    $summary = if (($mask -band [uint32]2032127) -eq [uint32]2032127) {
+        'Full control'
+    }
+    elseif (($mask -band [uint32]197055) -eq [uint32]197055) {
+        'Modify'
+    }
+    else {
+        $standardNames = @($capabilities | Where-Object { $_.Kind -eq 'Standard' -and $_.Granted } | ForEach-Object Name)
+        if ($standardNames.Count -gt 0) { $standardNames -join ', ' }
+        elseif ($mask -eq 0) { 'No access' }
+        else { 'Custom access' }
+    }
+
+    $contextMode = [string]$NativeResult.ContextMode
+    $contextCaveat = if ($contextMode -eq 'Current logon token') {
+        'Evaluated with the current process logon token, including its enabled groups.'
+    }
+    else {
+        'Evaluated from the requested SID with Authz group resolution; logon-only groups and runtime claims may differ from an actual sign-in token.'
+    }
+
+    return [PSCustomObject]@{
+        Success             = $true
+        RequestedIdentity   = $RequestedIdentity
+        Identity            = [string]$NativeResult.IdentityName
+        Sid                 = [string]$NativeResult.Sid
+        GrantedAccessMask   = $mask
+        GrantedAccessHex    = ('0x{0:X8}' -f $mask)
+        Summary             = $summary
+        ContextMode         = $contextMode
+        ContextCaveat       = $contextCaveat
+        Capabilities        = @($capabilities)
+        Error               = $null
+    }
+}
+
+function Get-PathForgeAclSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Identity,
+        [bool]$EvaluateEffective = $true
+    )
+
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $acl = Get-PathForgeAclObject -Path $item.FullName
+    $ownerReference = if ([string]$acl.Owner -match '^S-\d-') {
+        New-Object System.Security.Principal.SecurityIdentifier([string]$acl.Owner)
+    }
+    else {
+        New-Object System.Security.Principal.NTAccount([string]$acl.Owner)
+    }
+    $owner = Resolve-PathForgeIdentity -IdentityReference $ownerReference
+    $rules = foreach ($rule in @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+        ConvertTo-PathForgeAclRule -Rule $rule
+    }
+    $rules = @($rules | Sort-Object BaseKey, RightsMask)
+    $sections = [System.Security.AccessControl.AccessControlSections]::Access -bor
+        [System.Security.AccessControl.AccessControlSections]::Owner -bor
+        [System.Security.AccessControl.AccessControlSections]::Group
+    $securityDescriptor = $acl.GetSecurityDescriptorBinaryForm()
+    $effectiveAccess = $null
+    if ($EvaluateEffective) {
+        try {
+            $nativeResult = Get-PathForgeEffectiveAccessNative -SecurityDescriptor $securityDescriptor -Identity $Identity
+            $effectiveAccess = ConvertTo-PathForgeEffectiveAccess -NativeResult $nativeResult -RequestedIdentity $Identity
+        }
+        catch {
+            $effectiveAccess = [PSCustomObject]@{
+                Success             = $false
+                RequestedIdentity   = $Identity
+                Identity            = $Identity
+                Sid                 = $null
+                GrantedAccessMask   = [uint32]0
+                GrantedAccessHex    = '0x00000000'
+                Summary             = 'Evaluation unavailable'
+                ContextMode         = $null
+                ContextCaveat       = $null
+                Capabilities        = @()
+                Error               = $_.Exception.Message
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Path                    = [string]$item.FullName
+        IsDirectory             = [bool]$item.PSIsContainer
+        Owner                   = [string]$owner.Name
+        OwnerSid                = [string]$owner.Sid
+        Group                   = [string]$acl.Group
+        AreAccessRulesProtected = [bool]$acl.AreAccessRulesProtected
+        AreAccessRulesCanonical = [bool]$acl.AreAccessRulesCanonical
+        Sddl                    = [string]$acl.GetSecurityDescriptorSddlForm($sections)
+        AccessRules             = @($rules)
+        AccessRuleCount         = @($rules).Count
+        EffectiveAccess         = $effectiveAccess
+    }
+}
+
+function ConvertTo-PathForgeAclComparisonRow {
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Parameter(Mandatory)][string]$Change,
+        [string]$Principal,
+        [string]$AccessType,
+        [string]$PathA,
+        [string]$PathB,
+        [string]$Details
+    )
+
+    return [PSCustomObject]@{
+        Category   = $Category
+        Change     = $Change
+        Principal  = $Principal
+        AccessType = $AccessType
+        PathA      = $PathA
+        PathB      = $PathB
+        Details    = $Details
+    }
+}
+
+function Compare-PathForgeAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$PathA,
+        [Parameter(Mandatory)][string]$PathB,
+        [string]$Identity
+    )
+
+    $snapshotA = Get-PathForgeAclSnapshot -Path $PathA -Identity $Identity -EvaluateEffective $true
+    $snapshotB = Get-PathForgeAclSnapshot -Path $PathB -Identity $Identity -EvaluateEffective $true
+    $metadataRows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($definition in @(
+            @{Name = 'Owner'; A = $snapshotA.Owner; B = $snapshotB.Owner },
+            @{Name = 'Owner SID'; A = $snapshotA.OwnerSid; B = $snapshotB.OwnerSid },
+            @{Name = 'Inheritance protected'; A = [string]$snapshotA.AreAccessRulesProtected; B = [string]$snapshotB.AreAccessRulesProtected },
+            @{Name = 'Canonical ACL order'; A = [string]$snapshotA.AreAccessRulesCanonical; B = [string]$snapshotB.AreAccessRulesCanonical },
+            @{Name = 'Object type'; A = if ($snapshotA.IsDirectory) { 'Directory' } else { 'File' }; B = if ($snapshotB.IsDirectory) { 'Directory' } else { 'File' } })) {
+        $change = if ([string]$definition.A -ceq [string]$definition.B) { 'Same' } else { 'Changed' }
+        $metadataRows.Add((ConvertTo-PathForgeAclComparisonRow -Category 'Metadata' -Change $change -Principal $definition.Name -PathA ([string]$definition.A) -PathB ([string]$definition.B)))
+    }
+
+    $aceRows = New-Object 'System.Collections.Generic.List[object]'
+    $allBaseKeys = @(@($snapshotA.AccessRules | ForEach-Object BaseKey) + @($snapshotB.AccessRules | ForEach-Object BaseKey) | Sort-Object -Unique)
+    foreach ($baseKey in $allBaseKeys) {
+        $rulesA = @($snapshotA.AccessRules | Where-Object BaseKey -CEQ $baseKey | Sort-Object RightsMask)
+        $rulesB = @($snapshotB.AccessRules | Where-Object BaseKey -CEQ $baseKey | Sort-Object RightsMask)
+        $usedB = New-Object bool[] $rulesB.Count
+        $unmatchedA = New-Object 'System.Collections.Generic.List[object]'
+        for ($indexA = 0; $indexA -lt $rulesA.Count; $indexA++) {
+            $matchIndex = -1
+            for ($indexB = 0; $indexB -lt $rulesB.Count; $indexB++) {
+                if (-not $usedB[$indexB] -and $rulesA[$indexA].Signature -ceq $rulesB[$indexB].Signature) {
+                    $matchIndex = $indexB
+                    break
+                }
+            }
+            if ($matchIndex -ge 0) { $usedB[$matchIndex] = $true }
+            else { $unmatchedA.Add($rulesA[$indexA]) }
+        }
+        $unmatchedB = New-Object 'System.Collections.Generic.List[object]'
+        for ($indexB = 0; $indexB -lt $rulesB.Count; $indexB++) {
+            if (-not $usedB[$indexB]) { $unmatchedB.Add($rulesB[$indexB]) }
+        }
+
+        $pairedCount = [Math]::Min($unmatchedA.Count, $unmatchedB.Count)
+        for ($pairIndex = 0; $pairIndex -lt $pairedCount; $pairIndex++) {
+            $ruleA = $unmatchedA[$pairIndex]
+            $ruleB = $unmatchedB[$pairIndex]
+            $details = "SID $($ruleA.Sid); inherited=$($ruleA.IsInherited); inheritance=$($ruleA.InheritanceFlags); propagation=$($ruleA.PropagationFlags)"
+            $aceRows.Add((ConvertTo-PathForgeAclComparisonRow -Category 'ACL entry' -Change 'Rights changed' -Principal $ruleA.Identity -AccessType $ruleA.AccessType -PathA "$($ruleA.Rights) ($($ruleA.RightsMaskHex))" -PathB "$($ruleB.Rights) ($($ruleB.RightsMaskHex))" -Details $details))
+        }
+        for ($indexA = $pairedCount; $indexA -lt $unmatchedA.Count; $indexA++) {
+            $ruleA = $unmatchedA[$indexA]
+            $details = "SID $($ruleA.Sid); inherited=$($ruleA.IsInherited); inheritance=$($ruleA.InheritanceFlags); propagation=$($ruleA.PropagationFlags)"
+            $aceRows.Add((ConvertTo-PathForgeAclComparisonRow -Category 'ACL entry' -Change 'Only in A' -Principal $ruleA.Identity -AccessType $ruleA.AccessType -PathA "$($ruleA.Rights) ($($ruleA.RightsMaskHex))" -PathB '' -Details $details))
+        }
+        for ($indexB = $pairedCount; $indexB -lt $unmatchedB.Count; $indexB++) {
+            $ruleB = $unmatchedB[$indexB]
+            $details = "SID $($ruleB.Sid); inherited=$($ruleB.IsInherited); inheritance=$($ruleB.InheritanceFlags); propagation=$($ruleB.PropagationFlags)"
+            $aceRows.Add((ConvertTo-PathForgeAclComparisonRow -Category 'ACL entry' -Change 'Only in B' -Principal $ruleB.Identity -AccessType $ruleB.AccessType -PathA '' -PathB "$($ruleB.Rights) ($($ruleB.RightsMaskHex))" -Details $details))
+        }
+    }
+
+    $effectiveRows = New-Object 'System.Collections.Generic.List[object]'
+    $effectiveAvailable = [bool]$snapshotA.EffectiveAccess.Success -and [bool]$snapshotB.EffectiveAccess.Success
+    if ($effectiveAvailable) {
+        foreach ($definition in Get-PathForgeEffectiveRightCatalog) {
+            $grantedA = ($snapshotA.EffectiveAccess.GrantedAccessMask -band [uint32]$definition.Mask) -eq [uint32]$definition.Mask
+            $grantedB = ($snapshotB.EffectiveAccess.GrantedAccessMask -band [uint32]$definition.Mask) -eq [uint32]$definition.Mask
+            $change = if ($grantedA -eq $grantedB) { 'Same' } else { 'Changed' }
+            $effectiveRows.Add((ConvertTo-PathForgeAclComparisonRow -Category "Effective $($definition.Kind.ToLowerInvariant())" -Change $change -Principal $definition.Name -AccessType 'Authz' -PathA $(if ($grantedA) { 'Granted' } else { 'Not granted' }) -PathB $(if ($grantedB) { 'Granted' } else { 'Not granted' }) -Details ('Mask 0x{0:X8}' -f [uint32]$definition.Mask)))
+        }
+    }
+
+    $metadataDifferences = @($metadataRows.ToArray() | Where-Object Change -ne 'Same')
+    $effectiveDifferences = @($effectiveRows.ToArray() | Where-Object Change -ne 'Same')
+    $diffRows = @($metadataDifferences + @($aceRows.ToArray()) + $effectiveDifferences)
+    $exportRows = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($row in $metadataRows.ToArray()) { $exportRows.Add($row) }
+    foreach ($row in $aceRows.ToArray()) { $exportRows.Add($row) }
+    foreach ($row in $effectiveRows.ToArray()) { $exportRows.Add($row) }
+
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    if (-not $snapshotA.EffectiveAccess.Success) { $errors.Add("Path A effective access: $($snapshotA.EffectiveAccess.Error)") }
+    if (-not $snapshotB.EffectiveAccess.Success) { $errors.Add("Path B effective access: $($snapshotB.EffectiveAccess.Error)") }
+    $evaluatedIdentity = if ($snapshotA.EffectiveAccess.Identity) { [string]$snapshotA.EffectiveAccess.Identity } elseif ($Identity) { $Identity } else { '' }
+
+    return [PSCustomObject]@{
+        Success                    = $true
+        PathA                      = $snapshotA
+        PathB                      = $snapshotB
+        Identity                   = $evaluatedIdentity
+        EffectiveContextMode       = [string]$snapshotA.EffectiveAccess.ContextMode
+        EffectiveContextCaveat     = [string]$snapshotA.EffectiveAccess.ContextCaveat
+        StructuralEquivalent       = $metadataDifferences.Count -eq 0 -and $aceRows.Count -eq 0
+        EffectiveAvailable         = $effectiveAvailable
+        EffectiveEquivalent        = if ($effectiveAvailable) { $snapshotA.EffectiveAccess.GrantedAccessMask -eq $snapshotB.EffectiveAccess.GrantedAccessMask } else { $null }
+        MetadataDifferenceCount    = $metadataDifferences.Count
+        AceDifferenceCount         = $aceRows.Count
+        EffectiveDifferenceCount   = $effectiveDifferences.Count
+        MetadataRows               = $metadataRows.ToArray()
+        AceRows                    = $aceRows.ToArray()
+        EffectiveRows              = $effectiveRows.ToArray()
+        DiffRows                   = @($diffRows)
+        ExportRows                 = $exportRows.ToArray()
+        Errors                     = $errors.ToArray()
+    }
+}
+
 function Get-PathForgeNtfsVolumeDataNative {
     param([Parameter(Mandatory)][string]$Drive)
     return [PathForgeNtfsNative]::GetVolumeData($Drive)
@@ -3743,6 +4341,8 @@ Export-ModuleMember -Function @(
     'Get-PathForgeDeletionPlan',
     'Import-PathForgeDeletionBatch',
     'Invoke-PathForgeDeletionMethod',
+    'Get-PathForgeAclSnapshot',
+    'Compare-PathForgeAcl',
     'Get-PathForgeUsnReasonCatalog',
     'Get-PathForgeUsnJournal',
     'Get-PathForgeMftReport',

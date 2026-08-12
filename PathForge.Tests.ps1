@@ -6,6 +6,7 @@ BeforeAll {
 
     $functionNames = @(
         'Test-SafePath', 'Get-ValidatedPath', 'Get-VolumeFileSystem',
+        'Get-FileLockProcess', 'Invoke-ConsoleOutputTrim',
         'Test-ReparsePoint', 'Remove-ReparsePointSafe',
         'Remove-ItemStandard', 'Remove-ItemDotNet',
         'Initialize-Logging', 'Write-Log', 'Write-Console',
@@ -93,6 +94,82 @@ Describe "Test-ReparsePoint" {
         finally {
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue
         }
+    }
+}
+
+Describe "Get-FileLockProcess" {
+    It "Returns no lock information for an invalid path" {
+        @(Get-FileLockProcess -Path 'C:\bad; Get-Process').Count | Should -Be 0
+    }
+}
+
+Describe "Invoke-ConsoleOutputTrim" {
+    It "Trims old lines and inserts the marker" {
+        $originalBox = $Script:OutputBox
+        $originalLimit = $Script:MaxOutputChars
+        try {
+            $fakeBox = [PSCustomObject]@{
+                Text            = (("old line`r`n" * 20) + "new line`r`n")
+                SelectionStart  = 0
+                SelectionLength = 0
+            }
+            $fakeBox | Add-Member -MemberType ScriptProperty -Name TextLength -Value { $this.Text.Length }
+            $fakeBox | Add-Member -MemberType ScriptMethod -Name Select -Value {
+                param($start, $length)
+                $this.SelectionStart = $start
+                $this.SelectionLength = $length
+            }
+            $fakeBox | Add-Member -MemberType ScriptProperty -Name SelectedText -Value { "" } -SecondValue {
+                param($value)
+                $before = $this.Text.Substring(0, $this.SelectionStart)
+                $after = $this.Text.Substring($this.SelectionStart + $this.SelectionLength)
+                $this.Text = $before + $value + $after
+            }
+
+            $Script:OutputBox = $fakeBox
+            $Script:MaxOutputChars = 80
+            Invoke-ConsoleOutputTrim
+
+            $fakeBox.Text | Should -Match '^\[Output trimmed -- oldest entries removed\]'
+            $fakeBox.TextLength | Should -BeLessOrEqual $Script:MaxOutputChars
+            $fakeBox.Text | Should -Match 'new line'
+        }
+        finally {
+            $Script:OutputBox = $originalBox
+            $Script:MaxOutputChars = $originalLimit
+        }
+    }
+}
+
+Describe "Defensive path validation coverage" {
+    BeforeAll {
+        $source = Get-Content -LiteralPath $scriptPath -Raw
+    }
+
+    It "Validates paths before ADS and unblock operations" -ForEach @(
+        'Invoke-ADSScanner', 'Remove-AllADS', 'Invoke-UnblockFile', 'Invoke-UnblockRecursive'
+    ) {
+        $functionAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq $_
+        }, $true) | Select-Object -First 1
+
+        $functionAst | Should -Not -BeNullOrEmpty
+        $functionAst.Extent.Text | Should -Match 'Test-SafePath\s+-Path\s+\$Path'
+    }
+}
+
+Describe "Active operation form-close safety" {
+    It "prompts before closing and can cancel the close" {
+        $mainFormAst = $ast.FindAll({
+            $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $args[0].Name -eq 'Build-MainForm'
+        }, $true) | Select-Object -First 1
+
+        $mainFormAst.Extent.Text | Should -Match 'Add_FormClosing'
+        $mainFormAst.Extent.Text | Should -Match 'An operation is running\. Cancel it and close\?'
+        $mainFormAst.Extent.Text | Should -Match 'Stop-ActiveOperation'
+        $mainFormAst.Extent.Text | Should -Match '\$closingEvent\.Cancel\s*=\s*\$true'
     }
 }
 

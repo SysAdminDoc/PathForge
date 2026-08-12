@@ -70,6 +70,108 @@ public class BootDelete {
 }
 "@ -ErrorAction SilentlyContinue
 
+# Restart Manager lock-holder discovery
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class RestartManagerNative {
+    private const int ERROR_SUCCESS = 0;
+    private const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RM_UNIQUE_PROCESS {
+        public int dwProcessId;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+        public string strServiceShortName;
+        public uint ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(
+        uint dwSessionHandle,
+        uint nFiles,
+        string[] rgsFilenames,
+        uint nApplications,
+        RM_UNIQUE_PROCESS[] rgApplications,
+        uint nServices,
+        string[] rgsServiceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmGetList(
+        uint dwSessionHandle,
+        out uint pnProcInfoNeeded,
+        ref uint pnProcInfo,
+        [In, Out] RM_PROCESS_INFO[] rgAffectedApps,
+        ref uint lpdwRebootReasons);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmEndSession(uint pSessionHandle);
+
+    public static RM_PROCESS_INFO[] GetLockingProcesses(string path) {
+        if (String.IsNullOrEmpty(path)) {
+            return new RM_PROCESS_INFO[0];
+        }
+
+        uint sessionHandle;
+        int result = RmStartSession(out sessionHandle, 0, Guid.NewGuid().ToString("N"));
+        if (result != ERROR_SUCCESS) {
+            throw new InvalidOperationException("RmStartSession failed with code " + result);
+        }
+
+        try {
+            result = RmRegisterResources(sessionHandle, 1, new string[] { path }, 0, null, 0, null);
+            if (result != ERROR_SUCCESS) {
+                throw new InvalidOperationException("RmRegisterResources failed with code " + result);
+            }
+
+            uint needed;
+            uint count = 0;
+            uint rebootReasons = 0;
+            result = RmGetList(sessionHandle, out needed, ref count, null, ref rebootReasons);
+            if (result != ERROR_SUCCESS && result != ERROR_MORE_DATA) {
+                throw new InvalidOperationException("RmGetList failed with code " + result);
+            }
+            if (needed == 0) {
+                return new RM_PROCESS_INFO[0];
+            }
+
+            RM_PROCESS_INFO[] affected = new RM_PROCESS_INFO[needed];
+            count = needed;
+            result = RmGetList(sessionHandle, out needed, ref count, affected, ref rebootReasons);
+            if (result != ERROR_SUCCESS) {
+                throw new InvalidOperationException("RmGetList failed with code " + result);
+            }
+
+            var resultList = new List<RM_PROCESS_INFO>();
+            for (int i = 0; i < count; i++) {
+                resultList.Add(affected[i]);
+            }
+            return resultList.ToArray();
+        }
+        finally {
+            RmEndSession(sessionHandle);
+        }
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -94,6 +196,7 @@ $Script:CurrentTab = ""
 $Script:OperationRunning = $false
 $Script:ActiveProcess = $null
 $Script:RecycleBinCheck = $null
+$Script:MaxOutputChars = 50000
 
 # ============================================================================
 # COLOR THEME
@@ -754,8 +857,27 @@ function Write-Console {
         $Script:OutputBox.SelectionLength = 0
         $Script:OutputBox.SelectionColor = $color
         $Script:OutputBox.AppendText("$prefix$Message`r`n")
+        Invoke-ConsoleOutputTrim
         $Script:OutputBox.ScrollToCaret()
         [System.Windows.Forms.Application]::DoEvents()
+    }
+}
+
+function Invoke-ConsoleOutputTrim {
+    if (-not $Script:OutputBox -or $Script:OutputBox.TextLength -le $Script:MaxOutputChars) {
+        return
+    }
+
+    $marker = "[Output trimmed -- oldest entries removed]`r`n"
+    $targetLength = [Math]::Max(0, $Script:MaxOutputChars - $marker.Length)
+    $removeLength = $Script:OutputBox.TextLength - $targetLength
+    if ($removeLength -gt 0 -and $removeLength -lt $Script:OutputBox.TextLength) {
+        $lineBreak = $Script:OutputBox.Text.IndexOf("`n", $removeLength)
+        if ($lineBreak -ge 0) {
+            $removeLength = $lineBreak + 1
+        }
+        $Script:OutputBox.Select(0, $removeLength)
+        $Script:OutputBox.SelectedText = $marker
     }
 }
 
@@ -839,6 +961,46 @@ function Get-ValidatedPath {
         return $null
     }
     return $raw
+}
+
+function Get-FileLockProcess {
+    param([string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        return @()
+    }
+
+    try {
+        $processes = @([RestartManagerNative]::GetLockingProcesses($Path))
+    }
+    catch {
+        Write-Log "Restart Manager query failed for $Path : $_" -Level "WARN"
+        return @()
+    }
+
+    foreach ($process in $processes) {
+        $processId = [int]$process.Process.dwProcessId
+        if ($processId -le 0 -or $processId -eq $PID) {
+            continue
+        }
+
+        $processName = $process.strAppName
+        if ([string]::IsNullOrWhiteSpace($processName)) {
+            try {
+                $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName
+            }
+            catch {
+                $processName = "Unknown process"
+            }
+        }
+
+        [PSCustomObject]@{
+            ProcessName = $processName
+            ProcessId   = $processId
+            ServiceName = $process.strServiceShortName
+        }
+    }
 }
 
 function Get-VolumeFileSystem {
@@ -1030,6 +1192,12 @@ function Invoke-ForceDelete {
     if (-not (Test-Path -LiteralPath $Path) -and -not (Test-Path -LiteralPath "\\?\$Path")) {
         Write-Console "Path not found" -Type "Error"
         return $false
+    }
+
+    $lockers = @(Get-FileLockProcess -Path $Path)
+    foreach ($locker in $lockers) {
+        Write-Console "Locked by: $($locker.ProcessName) (PID $($locker.ProcessId))" -Type "Warning"
+        Write-Log "Locking process detected: $($locker.ProcessName) (PID $($locker.ProcessId)) for $Path" -Level "WARN"
     }
 
     if ($Script:RecycleBinCheck -and $Script:RecycleBinCheck.Checked) {
@@ -1554,6 +1722,13 @@ function Clear-PendingDeletions {
 function Invoke-ADSScanner {
     param([string]$Path)
 
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        Write-Log "ADS scan path rejected: $Path - $($check.Reason)" -Level "ERROR"
+        return @()
+    }
+
     $fs = Get-VolumeFileSystem -Path $Path
     if ($fs -ne "NTFS" -and $fs -ne "Unknown") {
         Write-Console "Alternate Data Streams are an NTFS-only feature" -Type "Warning"
@@ -1631,6 +1806,13 @@ function Invoke-ADSScanner {
 
 function Remove-AllADS {
     param([string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        Write-Log "ADS removal path rejected: $Path - $($check.Reason)" -Level "ERROR"
+        return
+    }
     
     Write-Console "Removing all alternate data streams from: $Path" -Type "Info"
     Set-Status "Removing ADS..."
@@ -1675,6 +1857,13 @@ function Remove-AllADS {
 
 function Invoke-UnblockFile {
     param([string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        Write-Log "Unblock path rejected: $Path - $($check.Reason)" -Level "ERROR"
+        return $false
+    }
     
     Write-Console "Removing Zone.Identifier (unblocking downloaded file)..." -Type "Info"
     Write-Console "This removes the 'This file came from another computer' warning" -Type "Normal"
@@ -1701,6 +1890,13 @@ function Invoke-UnblockFile {
 
 function Invoke-UnblockRecursive {
     param([string]$Path)
+
+    $check = Test-SafePath -Path $Path
+    if (-not $check.Valid) {
+        Write-Console "Rejected: $($check.Reason)" -Type "Error"
+        Write-Log "Recursive unblock path rejected: $Path - $($check.Reason)" -Level "ERROR"
+        return
+    }
     
     Write-Console "Unblocking all files recursively in: $Path" -Type "Info"
     Set-Status "Unblocking files..."
@@ -3429,6 +3625,28 @@ function Build-MainForm {
     
     # Dark title bar
     $form.Add_HandleCreated({ try { [DarkMode]::EnableDarkTitleBar($this.Handle) } catch {} })
+
+    $form.Add_FormClosing({
+        param($formSender, $closingEvent)
+        $null = $formSender
+
+        if (-not $Script:OperationRunning) {
+            return
+        }
+
+        $result = [System.Windows.Forms.MessageBox]::Show(
+            "An operation is running. Cancel it and close?",
+            "Operation in Progress",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Stop-ActiveOperation
+        }
+        else {
+            $closingEvent.Cancel = $true
+        }
+    })
     
     # Header panel
     $headerPanel = New-Object System.Windows.Forms.Panel

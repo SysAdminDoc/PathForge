@@ -6,6 +6,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1+-5391FE?style=flat&logo=powershell&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6?style=flat&logo=windows&logoColor=white)
+![Version](https://img.shields.io/badge/version-3.1.0-6969FF?style=flat)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ---
@@ -14,6 +15,7 @@ A professional PowerShell GUI toolkit for filesystem repair, stubborn file delet
 
 ### 🗑️ File Operations
 - **Six Deletion Methods** — Progressive escalation from PowerShell to WMI, including long path and 8.3 short name techniques
+- **Lock-Holder Identification** — Uses Windows Restart Manager to report the process and PID holding a target open before deletion
 - **Boot-Time Deletion** — Schedule stubborn files for removal on next restart via MoveFileEx API
 - **Take Ownership** — Seize control of protected system files with one click
 - **Permission Reset** — Restore inheritance and remove explicit deny entries
@@ -175,6 +177,8 @@ PathForge includes detailed explanations accessible via **ℹ️ Show Details** 
 - All operations wrapped in try/catch with user-friendly messages
 - Failed deletions automatically suggest next escalation method
 - Network and permission errors provide specific remediation steps
+- Active repairs can be cancelled safely, and closing the app during one prompts before terminating the child process
+- Long-running output is bounded to keep the embedded console responsive
 
 ---
 

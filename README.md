@@ -79,21 +79,9 @@ Every major feature includes an expandable info panel explaining:
 
 ## Installation
 
-### Option 1: Direct Download
-```powershell
-# Download and run
-$pathForgeDir = Join-Path $env:TEMP "PathForge"
-New-Item -Path $pathForgeDir -ItemType Directory -Force | Out-Null
-$baseUrl = "https://raw.githubusercontent.com/SysAdminDoc/PathForge/main"
-Invoke-WebRequest -Uri "$baseUrl/PathForge.ps1" -OutFile "$pathForgeDir\PathForge.ps1"
-Invoke-WebRequest -Uri "$baseUrl/PathForge.Core.psm1" -OutFile "$pathForgeDir\PathForge.Core.psm1"
-& "$pathForgeDir\PathForge.ps1"
-```
-
-### Option 2: Manual
-1. Download `PathForge.ps1` and `PathForge.Core.psm1` from [Releases](https://github.com/SysAdminDoc/PathForge/releases), keeping them in the same folder
-2. Right-click -> **Run with PowerShell**
-3. Accept the UAC prompt
+1. Download the source as a zip from GitHub's [Download ZIP](https://github.com/SysAdminDoc/PathForge/archive/refs/heads/main.zip) link. It contains `PathForge.ps1` and the `PathForge.Core.psm1` module it needs, together in the same folder.
+2. Extract the zip, then right-click `PathForge.ps1` and select **Run with PowerShell**.
+3. Accept the UAC prompt.
 
 > **Note:** If you encounter execution policy restrictions:
 > ```powershell

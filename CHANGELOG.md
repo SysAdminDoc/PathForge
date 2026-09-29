@@ -4,6 +4,9 @@ All notable changes to PathForge will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- The README's install section no longer pastes an `Invoke-WebRequest` fetch-and-run block. It now points to GitHub's Download ZIP link, since the release page doesn't currently carry `PathForge.Core.psm1` alongside `PathForge.ps1` and the script needs both in the same folder.
+
 ### Added
 - Restart Manager lock-holder diagnostics report process names and PIDs before deletion attempts
 - Version badge in the README
